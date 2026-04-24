@@ -1,0 +1,98 @@
+{
+  "email_sender": "trigger@tuempresa.com",
+  "email_subject": "avance_ventas - Actualización disponible",
+  "check_interval_minutes": 10,
+  "processed_emails_file": "C:/AVANCE_MOVISTAR/processed_emails.txt",
+  "temp_dir": "C:/AVANCE_MOVISTAR/temp",
+  "archivos_avance_dir": "C:/AVANCE_MOVISTAR/Archivos_Avance",
+
+  "google_credentials_path": "C:/AVANCE_MOVISTAR/credentials.json",
+  "google_token_path": "C:/AVANCE_MOVISTAR/token.json",
+
+  "avance_resumido_path": "C:/AVANCE_MOVISTAR/files/AVANCE_RESUMIDO.xlsx",
+
+  "wa_host": "localhost",
+  "wa_port": 8002,
+
+  "backs_wa_group": "Nombre del grupo de backs en WhatsApp",
+  "backs_google_sheet_id": "ID_DE_TU_GOOGLE_SHEET",
+  "backs_message": "Buen día equipo, el avance de ventas fue actualizado.",
+  "backs_message_variants": [
+    "Buen día equipo, el avance fue actualizado. Revisen el Drive.",
+    "Hola equipo, ya está disponible el avance del día.",
+    "Buenos días, se actualizó el reporte de ventas."
+  ],
+
+  "jefes_wa_group": "Nombre del grupo de jefes en WhatsApp",
+  "jefes_tds_rango1": "B4:V15",
+  "jefes_tds_rango2": "Y4:AT16",
+  "jefes_mensaje_captura1_variants": [
+    "@NUMERO1 @NUMERO2 Buen día, remito avances actualizados.",
+    "@NUMERO1 @NUMERO2 Buenos días, adjunto el archivo actualizado."
+  ],
+  "jefes_mensaje_captura2_variants": [
+    "@NUMERO1 Detalle de avances por supervisor.",
+    "@NUMERO1 Aquí el detalle por supervisor."
+  ],
+  "jefes_mensaje_seguimiento_variants": [
+    "@NUMERO1 Adjunto el reporte de productividad actualizado.",
+    "@NUMERO1 Comparto el reporte actualizado."
+  ],
+  "jefes_mensaje_captura1": "@NUMERO1 @NUMERO2 Buen día, remito avances actualizados.",
+  "jefes_mensaje_captura2": "@NUMERO1 Detalle de avances por supervisor.",
+  "jefes_mensaje_seguimiento": "@NUMERO1 Adjunto el reporte de productividad actualizado.",
+  "jefes_menciones": ["NUMERO1@c.us", "NUMERO2@c.us"],
+
+  "cristian_wa_contact": "Nombre Contacto 1",
+  "cristian_message": "Hola, adjunto el avance actualizado.",
+  "cristian_message_variants": [
+    "Hola, adjunto el avance actualizado.",
+    "Buenos días, te mando el reporte hasta ayer.",
+    "Aquí el avance de ventas."
+  ],
+
+  "jesus_wa_contact": "Nombre Contacto 2",
+  "jesus_message": "Buen día, adjunto el avance de ventas actualizado.",
+  "jesus_message_variants": [
+    "Buen día, adjunto el avance de ventas actualizado.",
+    "Te envío el avance actualizado.",
+    "Adjunto el reporte de ventas D-1."
+  ],
+
+  "guillermo_wa_contact": "Nombre Contacto 3",
+  "guillermo_message": "Buen día, adjunto el avance de ventas actualizado.",
+  "guillermo_message_variants": [
+    "Buen día, adjunto el avance de ventas actualizado.",
+    "Te mando el reporte al D-1.",
+    "Remito el avance de ventas actualizado."
+  ],
+
+  "carlos_wa_contact": "Nombre Contacto 4",
+  "carlos_message": "Hola, adjunto el avance de ventas actualizado.",
+  "carlos_message_variants": [
+    "Buen día, adjunto el avance de ventas actualizado hasta ayer.",
+    "Te mando el reporte al D-1.",
+    "Remito el avance de ventas actualizado."
+  ],
+
+  "italo_wa_contact": "Nombre Contacto 5",
+  "italo_google_sheet_id": "ID_DE_TU_GOOGLE_SHEET",
+  "italo_message": "Hola, el reporte fue actualizado en Google Sheets.",
+  "italo_message_variants": [
+    "El reporte fue actualizado en Google Sheets. Ya puedes revisarlo.",
+    "Buen día, el reporte hasta ayer ya está disponible en Sheets."
+  ],
+
+  "groups": {
+    "Nombre Grupo 1": "ID_GRUPO_WHATSAPP@g.us",
+    "Nombre Grupo 2": "ID_GRUPO_WHATSAPP@g.us"
+  },
+
+  "contacts": {
+    "Nombre Contacto 1": "NUMERO@c.us",
+    "Nombre Contacto 2": "NUMERO@c.us",
+    "Nombre Contacto 3": "NUMERO@c.us",
+    "Nombre Contacto 4": "NUMERO@c.us",
+    "Nombre Contacto 5": "NUMERO@c.us"
+  }
+}

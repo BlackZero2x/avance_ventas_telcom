@@ -1,0 +1,38 @@
+# ── Credenciales y tokens (NUNCA subir) ───────────────────────────────────────
+credentials.json
+token.json
+
+# ── Configuración con datos reales (usar config.example.json) ─────────────────
+config.json
+whatsapp_server/config.json
+
+# ── Sesión de WhatsApp ────────────────────────────────────────────────────────
+whatsapp_server/session_data/
+whatsapp_server/.node-persist/
+whatsapp_server/screenshot_*.png
+
+# ── Dependencias Node.js ──────────────────────────────────────────────────────
+node_modules/
+whatsapp_server/node_modules/
+
+# ── Cache Python ──────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+
+# ── Archivos de datos y reportes generados ────────────────────────────────────
+Archivos_Avance/
+files/
+temp/
+*.xlsx
+processed_emails.txt
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs/
+whatsapp_server/logs/
+
+# ── Versiones antiguas ────────────────────────────────────────────────────────
+versiones/
+
+# ── Claude Code ───────────────────────────────────────────────────────────────
+.claude/
