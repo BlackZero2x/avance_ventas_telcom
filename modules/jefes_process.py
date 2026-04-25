@@ -92,6 +92,25 @@ class JefesProcess:
             sheet.activate()
             time.sleep(1)
 
+            # Traer Excel al frente — CopyPicture falla si Excel no es la ventana activa.
+            # Usamos tanto la API COM de Excel como win32gui para maximizar las chances
+            # en ejecuciones desatendidas (Programador de Tareas).
+            try:
+                app.api.Visible = True
+                app.api.ActiveWindow.Activate()
+            except Exception:
+                pass
+            if excel_hwnd:
+                try:
+                    import ctypes
+                    # AllowSetForegroundWindow permite traer al frente desde procesos sin foco
+                    ctypes.windll.user32.AllowSetForegroundWindow(ctypes.windll.kernel32.GetCurrentProcessId())
+                    win32gui.ShowWindow(excel_hwnd, 9)   # SW_RESTORE
+                    win32gui.SetForegroundWindow(excel_hwnd)
+                    time.sleep(1)
+                except Exception as e:
+                    logging.warning(f"  No se pudo traer Excel al frente: {e}")
+
             msg_captura1 = pick_variant(self.config.get("jefes_mensaje_captura1_variants"), self.config["jefes_mensaje_captura1"])
             msg_captura2 = pick_variant(self.config.get("jefes_mensaje_captura2_variants"), self.config["jefes_mensaje_captura2"])
 
@@ -100,6 +119,15 @@ class JefesProcess:
                 (self.config["jefes_tds_rango2"], os.path.join(temp_dir, "captura_tds_2.png"), msg_captura2),
             ]:
                 logging.info(f"  Capturando TDS!{rango}...")
+                # Actualizar handle y asegurar foco antes de CopyPicture
+                excel_hwnd = self._get_excel_hwnd() or excel_hwnd
+                if excel_hwnd:
+                    try:
+                        win32gui.ShowWindow(excel_hwnd, 9)
+                        win32gui.SetForegroundWindow(excel_hwnd)
+                        time.sleep(0.5)
+                    except Exception:
+                        pass
                 # Scroll al rango para que sea visible antes de CopyPicture
                 sheet.range(rango).api.Select()
                 app.api.ActiveWindow.ScrollIntoView(

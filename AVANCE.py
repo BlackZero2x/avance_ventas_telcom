@@ -2401,6 +2401,7 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
     )
     # Guardar fecha para ordenar filas correctamente
     _mf_work["_dia_orden"] = _mf_work["_fecha"].dt.day
+    _mf_work["Q"] = 1  # columna auxiliar para pivots de conteo
 
     # ── TABLA 1: filas=día (ddd dd), cols=FILIAL, vals=count ─────────────
     _t1 = _mf_work.pivot_table(

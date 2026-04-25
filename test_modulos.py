@@ -349,6 +349,30 @@ def test_italo():
     logging.info("[OK] Prueba ITALO completada")
 
 
+def test_carlos():
+    logging.info("--- PRUEBA: CarlosProcess (diagnostico de envio) ---")
+    archivo = buscar_avance()
+
+    logging.info("TEST 1: Listar contactos que contienen 'Carlos'")
+    contactos = wa.list_contacts("Carlos")
+    for c in contactos:
+        logging.info(f"  Nombre: {c['name']:<30} ID: {c['id']:<20} Push: {c.get('pushname', 'N/A')}")
+
+    logging.info("TEST 2: Enviar texto a 'Carlos P.' (por nombre en config)")
+    r1 = wa.send_text(config.get("carlos_wa_contact", "Carlos P."), config.get("carlos_message", "Prueba"))
+    logging.info(f"  Resultado: {r1}")
+    time.sleep(3)
+
+    if archivo:
+        logging.info(f"TEST 3: Enviar archivo a Carlos: {os.path.basename(archivo)}")
+        r2 = wa.send_file(config.get("carlos_wa_contact", "Carlos P."), archivo, caption="")
+        logging.info(f"  Resultado: {r2}")
+    else:
+        logging.warning("  No se encontro AVANCE_*.xlsx — omitiendo envio de archivo")
+
+    logging.info("[OK] Prueba CARLOS completada")
+
+
 def test_menciones():
     """
     Muestra la diferencia entre texto plano con @ y mencion real de WhatsApp.
@@ -443,6 +467,7 @@ PRUEBAS = {
     "jesus":        test_jesus,
     "cristian":     test_cristian,
     "guillermo":    test_guillermo,
+    "carlos":       test_carlos,
     "italo":        test_italo,
     "menciones":    test_menciones,
     "orquestador":  test_orquestador,

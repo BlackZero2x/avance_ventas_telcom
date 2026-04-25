@@ -30,12 +30,12 @@ ping 127.0.0.1 -n 4 >NUL
 cd /d "%SERVER_DIR%"
 start /min "wa_server" "%NODE_EXE%" "%SERVER_JS%"
 
-:: Esperar hasta 90 segundos a que el servidor este listo (18 x 5s)
+:: Esperar hasta 3 minutos a que el servidor este listo (36 x 5s)
 set intentos=0
 :esperar
 set /a intentos+=1
-if %intentos% GTR 18 (
-    echo [%date% %time%] ERROR: Servidor no respondio tras 90s. >> "%LOG_FILE%"
+if %intentos% GTR 36 (
+    echo [%date% %time%] ERROR: Servidor no respondio tras 3 minutos. >> "%LOG_FILE%"
     exit /b 1
 )
 ping 127.0.0.1 -n 6 >NUL
@@ -54,7 +54,7 @@ exit /b 0
 set reintento=0
 :reintentar
 set /a reintento+=1
-"%PYTHON_EXE%" "%WA_CLIENT%" --send-text "%MY_NUMBER%" "[OK] Servidor WhatsApp activo" >NUL 2>&1
+"%PYTHON_EXE%" "%WA_CLIENT%" --send-to "%MY_NUMBER%" --message "[OK] Servidor WhatsApp activo" >NUL 2>&1
 if %ERRORLEVEL% EQU 0 (
     echo [%date% %time%] Confirmacion enviada exitosamente (intento %reintento%). >> "%LOG_FILE%"
     exit /b 0
