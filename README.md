@@ -1,4 +1,4 @@
-# Avance Movistar — Sistema de Seguimiento de Ventas
+# Reporte y Sistema de Seguimiento de Ventas
 
 Pipeline de automatización de reportes de ventas para la línea fija de Movistar Perú. Consolida datos de SQL Server y Excel, genera dashboards diarios y distribuye reportes automáticamente por WhatsApp y Google Sheets.
 
@@ -36,7 +36,7 @@ SQL Server (eAuren) + Excel (rh, lcf, cuotas)
         ├── JefesProcess    → capturas TDS + archivo → grupo WhatsApp
         ├── JesusProcess    → archivo → contacto WhatsApp
         ├── CristianProcess → archivo → contacto WhatsApp
-        ├── GuillermnoProcess → archivo → contacto WhatsApp
+        ├── GuillermoProcess → archivo → contacto WhatsApp
         ├── CarlosProcess   → archivo → contacto WhatsApp
         └── ItaloProcess    → Google Sheets + contacto WhatsApp
                 │
