@@ -1,4 +1,4 @@
-# Avance Movistar — Sistema de Seguimiento de Ventas (Automatizado)
+# Reporte y Sistema de Seguimiento de Ventas
 
 Sistema de automatización end-to-end para el seguimiento diario de ventas de la línea fija de Movistar Perú. Consolida datos de múltiples fuentes, genera dashboards Excel con indicadores de gestión y los distribuye automáticamente a los integrantes del equipo comercial por WhatsApp y Google Sheets, sin intervención manual.
 
