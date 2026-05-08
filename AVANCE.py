@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import numpy as np
 from sqlalchemy import create_engine
@@ -7,6 +8,243 @@ from pathlib import Path
 
 import re
 import sys
+from dotenv import load_dotenv
+
+import openpyxl as _openpyxl
+from openpyxl.styles import Font as _oxFont, PatternFill as _oxFill, Alignment as _oxAlign, Border as _oxBorder, Side as _oxSide
+from openpyxl.utils import get_column_letter as _ox_gcl
+
+load_dotenv(Path(__file__).parent / '.env')
+
+# ══════════════════════════════════════════════════════════════
+# SEGUIMIENTO DIARIO — helpers integrados (antes en generar_seguimiento_diario.py)
+# ══════════════════════════════════════════════════════════════
+
+_SEG_COLOR_VDD   = "1F3864"
+_SEG_COLOR_RT    = "1E6B3C"
+_SEG_COLOR_ALT   = "7E3000"
+_SEG_COLOR_CON   = "4A235A"
+_SEG_COLOR_TOT   = "000000"
+_SEG_COLOR_ALERT = "FFFF00"
+_SEG_COLS_VDD    = ["ZONAL", "SUPERVISOR", "DNI", "VENDEDOR", "ANTIG", "F_INGRESO", "ESQUEMA"]
+_SEG_FNT         = "Aptos Narrow"
+_SEG_FNT_SIZE    = 11
+
+_seg_thin   = _oxSide(style="thin", color="CCCCCC")
+_seg_border = _oxBorder(left=_seg_thin, right=_seg_thin, top=_seg_thin, bottom=_seg_thin)
+_seg_alt_fill  = _oxFill("solid", fgColor="F2F2F2")
+_seg_even_fill = _oxFill("solid", fgColor="FFFFFF")
+
+
+def _seg_make_fill(hex_color):
+    return _oxFill("solid", fgColor=hex_color)
+
+def _seg_make_font(bold=True, color="FFFFFF", size=_SEG_FNT_SIZE):
+    return _oxFont(name=_SEG_FNT, bold=bold, color=color, size=size)
+
+
+def _seg_pivot_por_dia(df_src, dni_col, fecha_col, val_col=None, prefix=""):
+    tmp = df_src.dropna(subset=[dni_col, fecha_col]).copy()
+    tmp["dia"] = pd.to_datetime(tmp[fecha_col]).dt.day
+    if val_col and val_col in tmp.columns:
+        piv = tmp.groupby([dni_col, "dia"])[val_col].sum().unstack(fill_value=0)
+    else:
+        piv = tmp.groupby([dni_col, "dia"]).size().unstack(fill_value=0)
+    piv.columns = [f"{prefix}_D{int(c):02d}" for c in piv.columns]
+    piv = piv.reset_index().rename(columns={dni_col: "DNI"})
+    piv["DNI"] = piv["DNI"].astype("Int64")
+    day_cols = [c for c in piv.columns if c != "DNI"]
+    piv[f"TOTAL_{prefix}"] = piv[day_cols].sum(axis=1)
+    return piv
+
+
+def _seg_sort_block(cols, prefix):
+    day_cols  = sorted([c for c in cols if c != f"TOTAL_{prefix}"], key=lambda x: int(x.split("_D")[1]))
+    total_col = [f"TOTAL_{prefix}"] if f"TOTAL_{prefix}" in cols else []
+    return day_cols + total_col
+
+
+def _seg_construir_resultado(avance_path, periodo, seg_engine):
+    vdd1_raw = pd.read_excel(avance_path, sheet_name="VDD1", header=0)
+    vdd1 = vdd1_raw.iloc[:, :7].copy()
+    vdd1.columns = _SEG_COLS_VDD
+    vdd1["DNI"] = pd.to_numeric(vdd1["DNI"], errors="coerce").astype("Int64")
+
+    rt_raw = pd.read_excel(avance_path, sheet_name="RT", header=0)
+    rt_raw["DNI_VENDEDOR"] = pd.to_numeric(rt_raw["DNI_VENDEDOR"], errors="coerce").astype("Int64")
+    rt_raw["fecha"] = pd.to_datetime(rt_raw["Fecha_de_alta"], errors="coerce").dt.date
+
+    altas_raw = pd.read_excel(avance_path, sheet_name="ALTAS", header=0)
+    altas_raw["DNI_VENDEDOR"] = pd.to_numeric(altas_raw["DNI_VENDEDOR"], errors="coerce").astype("Int64")
+    altas_raw["fecha"] = pd.to_datetime(altas_raw["Fecha_de_alta"], errors="coerce").dt.date
+
+    sql_con = f"""
+SELECT
+    [fecha_registro],
+    [documento_v],
+    [zonal_consulta] AS ZONAL,
+    [consulta_unica],
+    SUM(1) AS CONSULTAS
+FROM [eAuren].[dbo].[fija_base_dito_consultas_hoy]
+WHERE periodo='{periodo}' AND tipo='INTENCIONES'
+GROUP BY
+    [fecha_registro],
+    [documento_v],
+    [zonal_consulta],
+    [consulta_unica]
+"""
+    df_con = pd.read_sql(sql_con, seg_engine)
+    df_con["DNI_VENDEDOR"] = pd.to_numeric(df_con["documento_v"], errors="coerce").astype("Int64")
+    df_con["fecha"] = pd.to_datetime(df_con["fecha_registro"], errors="coerce").dt.date
+
+    piv_rt  = _seg_pivot_por_dia(rt_raw,    "DNI_VENDEDOR", "fecha", prefix="RT")
+    piv_alt = _seg_pivot_por_dia(altas_raw, "DNI_VENDEDOR", "fecha", prefix="ALT")
+    piv_con = _seg_pivot_por_dia(df_con,    "DNI_VENDEDOR", "fecha", val_col="CONSULTAS", prefix="CON")
+
+    resultado = vdd1.copy()
+    resultado = resultado.merge(piv_rt,  on="DNI", how="left")
+    resultado = resultado.merge(piv_alt, on="DNI", how="left")
+    resultado = resultado.merge(piv_con, on="DNI", how="left")
+
+    for c in [col for col in resultado.columns if col not in _SEG_COLS_VDD]:
+        if resultado[c].dtype in ("float64", "object"):
+            try:
+                resultado[c] = resultado[c].fillna(0).astype(int)
+            except Exception:
+                resultado[c] = resultado[c].fillna(0)
+
+    rt_cols  = _seg_sort_block([c for c in resultado.columns if c.startswith("RT_")],  "RT")
+    alt_cols = _seg_sort_block([c for c in resultado.columns if c.startswith("ALT_")], "ALT")
+    con_cols = _seg_sort_block([c for c in resultado.columns if c.startswith("CON_")], "CON")
+    col_order = _SEG_COLS_VDD + rt_cols + alt_cols + con_cols
+    return resultado[col_order], col_order
+
+
+def _seg_agregar_hoja(wb, avance_path, periodo, seg_engine):
+    """Agrega la hoja VDD2 (seguimiento diario) al workbook openpyxl recibido."""
+    print("[OK] Generando hoja VDD2...")
+    resultado, col_order = _seg_construir_resultado(avance_path, periodo, seg_engine)
+    print(f"[OK] VDD2: {len(resultado)} vendedores, {len(col_order)} columnas")
+
+    ws = wb.create_sheet("VDD2")
+
+    f_ingreso_ci = _SEG_COLS_VDD.index("F_INGRESO") + 1  # columna 6
+
+    rt_day_cols  = sorted([c for c in col_order if c.startswith("RT_D")],
+                          key=lambda x: int(x.split("_D")[1]))
+    alt_day_cols = sorted([c for c in col_order if c.startswith("ALT_D")],
+                          key=lambda x: int(x.split("_D")[1]))
+    con_day_cols = sorted([c for c in col_order if c.startswith("CON_D")],
+                          key=lambda x: int(x.split("_D")[1]))
+
+    n_base = len(col_order)
+    ci_rt_ult  = n_base + 1
+    ci_con_ult = n_base + 2
+    ci_alt_ult = n_base + 3
+    ci_alertas = n_base + 4
+
+    # Fila 1: encabezados de columna con color por bloque
+    headers_row1, colors_row1 = [], []
+    for col in _SEG_COLS_VDD:
+        headers_row1.append(col);  colors_row1.append(_SEG_COLOR_VDD)
+    for col in [c for c in col_order if c.startswith("RT_")]:
+        headers_row1.append(col);  colors_row1.append(_SEG_COLOR_TOT if col.startswith("TOTAL") else _SEG_COLOR_RT)
+    for col in [c for c in col_order if c.startswith("ALT_")]:
+        headers_row1.append(col);  colors_row1.append(_SEG_COLOR_TOT if col.startswith("TOTAL") else _SEG_COLOR_ALT)
+    for col in [c for c in col_order if c.startswith("CON_")]:
+        headers_row1.append(col);  colors_row1.append(_SEG_COLOR_TOT if col.startswith("TOTAL") else _SEG_COLOR_CON)
+    for col in ["RT_ULT_3D", "CON_ULT_3D", "ALT_ULT_3D"]:
+        headers_row1.append(col);  colors_row1.append(_SEG_COLOR_TOT)
+    headers_row1.append("ALERTAS"); colors_row1.append(_SEG_COLOR_ALERT)
+
+    for ci, (text, color) in enumerate(zip(headers_row1, colors_row1), start=1):
+        cell = ws.cell(row=1, column=ci, value=text)
+        cell.fill      = _seg_make_fill(color)
+        cell.font      = _seg_make_font(color="000000" if color == _SEG_COLOR_ALERT else "FFFFFF")
+        cell.alignment = _oxAlign(horizontal="center", vertical="center", wrap_text=True)
+        cell.border    = _seg_border
+
+    def _refs_ult3(day_cols, row):
+        cols3 = day_cols[-3:] if len(day_cols) >= 3 else day_cols
+        return [f"{_ox_gcl(col_order.index(c) + 1)}{row}" for c in cols3]
+
+    # Filas de datos desde fila 2
+    for ri, row_data in enumerate(resultado.itertuples(index=False), start=2):
+        fill      = _seg_alt_fill if ri % 2 == 0 else _seg_even_fill
+        base_font = _oxFont(name=_SEG_FNT, size=_SEG_FNT_SIZE)
+
+        for ci, val in enumerate(row_data, start=1):
+            cell = ws.cell(row=ri, column=ci)
+            if not isinstance(val, str) and pd.isna(val):
+                cell.value = None
+            else:
+                try:    cell.value = int(val)
+                except: cell.value = val
+            cell.fill      = fill
+            cell.border    = _seg_border
+            cell.font      = base_font
+            cell.alignment = _oxAlign(horizontal="left" if ci <= len(_SEG_COLS_VDD) else "center",
+                                      vertical="center")
+            if ci == f_ingreso_ci:
+                cell.number_format = "DD/MM/YYYY"
+
+        for col_idx, refs_fn, day_cols in [
+            (ci_rt_ult,  _refs_ult3, rt_day_cols),
+            (ci_con_ult, _refs_ult3, con_day_cols),
+            (ci_alt_ult, _refs_ult3, alt_day_cols),
+        ]:
+            refs = refs_fn(day_cols, ri)
+            c = ws.cell(row=ri, column=col_idx)
+            c.value         = f"=SUM({','.join(refs)})" if refs else 0
+            c.fill          = fill
+            c.border        = _seg_border
+            c.font          = base_font
+            c.alignment     = _oxAlign(horizontal="center", vertical="center")
+            c.number_format = "#,##0"
+
+        col_rt_l  = _ox_gcl(ci_rt_ult)
+        col_con_l = _ox_gcl(ci_con_ult)
+        col_alt_l = _ox_gcl(ci_alt_ult)
+        total_alt_col = next((c for c in col_order if c == "TOTAL_ALT"), None)
+        if total_alt_col:
+            col_total_alt_l = _ox_gcl(col_order.index(total_alt_col) + 1)
+            alerta_formula = (
+                f'=IF({col_con_l}{ri}=0,"SIN CON ULT3D",'
+                f'IF({col_rt_l}{ri}=0,"SIN RT ULT3D",'
+                f'IF({col_alt_l}{ri}=0,"SIN ALTAS ULT3D",'
+                f'CONCATENATE({col_total_alt_l}{ri}," ALT"))))'
+            )
+        else:
+            alerta_formula = (
+                f'=IF({col_con_l}{ri}=0,"SIN CON ULT3D",'
+                f'IF({col_rt_l}{ri}=0,"SIN RT ULT3D",'
+                f'IF({col_alt_l}{ri}=0,"SIN ALTAS ULT3D","OK")))'
+            )
+        ca = ws.cell(row=ri, column=ci_alertas, value=alerta_formula)
+        ca.fill      = _seg_make_fill(_SEG_COLOR_ALERT)
+        ca.border    = _seg_border
+        ca.font      = _oxFont(name=_SEG_FNT, size=_SEG_FNT_SIZE, bold=True, color="000000")
+        ca.alignment = _oxAlign(horizontal="center", vertical="center")
+
+    # Anchos
+    ws.column_dimensions["A"].width = 14
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 12
+    ws.column_dimensions["D"].width = 22
+    ws.column_dimensions["E"].width = 10
+    ws.column_dimensions["F"].width = 12
+    ws.column_dimensions["G"].width = 12
+    for ci in range(len(_SEG_COLS_VDD) + 1, n_base + 1):
+        ws.column_dimensions[_ox_gcl(ci)].width = (
+            11 if col_order[ci - 1].startswith("TOTAL") else 7)
+    for ci in [ci_rt_ult, ci_con_ult, ci_alt_ult]:
+        ws.column_dimensions[_ox_gcl(ci)].width = 12
+    ws.column_dimensions[_ox_gcl(ci_alertas)].width = 18
+
+    ws.row_dimensions[1].height = 25
+    ws.freeze_panes = ws.cell(row=2, column=len(_SEG_COLS_VDD) + 1)
+
+    return ws
 
 def _pedir_periodo():
     """Devuelve el período AAAA-MM: desde argv[1], o el mes actual si no se pasa argumento."""
@@ -15,7 +253,7 @@ def _pedir_periodo():
         _arg = sys.argv[1].strip()
         if re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", _arg):
             return _arg
-        print(f"  Formato inválido '{_arg}'. Usa AAAA-MM, por ejemplo 2026-04.")
+        print(f"  Formato inválido '{_arg}'. Usa AAAA-MM, por ejemplo 2026-05.")
         sys.exit(1)
     return _default
 
@@ -27,19 +265,24 @@ print(f"Período: {PERIODO}")
 # ══════════════════════════════════════════════════════════════
 
 # ── SQL Server: tabla principal ────────────────────────────────
+_sql_server   = os.environ.get('SQL_SERVER',   r'AUREN22\AUREN')
+_sql_database = os.environ.get('SQL_DATABASE', 'eAuren')
+_sql_user     = os.environ['SQL_USER']
+_sql_password = os.environ['SQL_PASSWORD']
+
 params = urllib.parse.quote_plus(
-    "DRIVER={ODBC Driver 17 for SQL Server};"
-    "SERVER=AUREN22\\AUREN;"
-    "DATABASE=eAuren;"
-    "UID={_sql_user};"
-    "PWD={_sql_password};"
+    f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+    f"SERVER={_sql_server};"
+    f"DATABASE={_sql_database};"
+    f"UID={_sql_user};"
+    f"PWD={_sql_password};"
 )
 engine = create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
 
-sql = """
+sql = f"""
 DECLARE @periodo AS CHAR(7)
 DECLARE @periodoAnterior AS CHAR(7)
-SET @periodo = '2026-04';
+SET @periodo = '{PERIODO}';
 SET @periodoAnterior = CONVERT(CHAR(7), DATEADD(MONTH, -1, CONVERT(DATE, @periodo + '-01')), 126);
 
 WITH realme AS (
@@ -404,7 +647,7 @@ ORDER BY Fecha_Registro ASC;
 sql_rt = """
 DECLARE @periodo AS CHAR(7)
 DECLARE @periodoAnterior AS CHAR(7)
-SET @periodo = '2026-04';
+SET @periodo = '2026-05';
 SET @periodoAnterior = CONVERT(CHAR(7), DATEADD(MONTH, -1, CONVERT(DATE, @periodo + '-01')), 126);
 
 WITH realme AS (
@@ -772,8 +1015,8 @@ PERIODO_ANT = (
     pd.Timestamp(PERIODO + "-01") - pd.offsets.MonthBegin(1)
 ).strftime("%Y-%m")
 
-sql    = sql.replace(   "SET @periodo = '2026-04';", f"SET @periodo = '{PERIODO}';")
-sql_rt = sql_rt.replace("SET @periodo = '2026-04';", f"SET @periodo = '{PERIODO}';")
+sql    = sql.replace(   "SET @periodo = '2026-05';", f"SET @periodo = '{PERIODO}';")
+sql_rt = sql_rt.replace("SET @periodo = '2026-05';", f"SET @periodo = '{PERIODO}';")
 
 # SQL mes anterior: misma query principal con PERIODO_ANT
 sql_ant = sql.replace(f"SET @periodo = '{PERIODO}';", f"SET @periodo = '{PERIODO_ANT}';")
@@ -785,13 +1028,62 @@ df_ant    = pd.read_sql(sql_ant, engine)   # altas del mes anterior
 engine.dispose()
 
 # ── Google Sheets: VENTORY y RH ────────────────────────────────
-URL_VENTORY = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSXxqrGGs4_mU4n511v3zBkKo4buAFv0TwrlrrX4XD2jFjIT7cC8kvH7ER32Ye2hiOpo3mAFsUkyydg/pub?gid=22270598&single=true&output=csv"
-URL_RH      = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSXxqrGGs4_mU4n511v3zBkKo4buAFv0TwrlrrX4XD2jFjIT7cC8kvH7ER32Ye2hiOpo3mAFsUkyydg/pub?gid=241856834&single=true&output=csv"
-URL_MF      = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQoJkR0gbsSLkLd2vv1JjtARboRLdaKLM64MPnuxyyZmLbAOEcA6jCuz9hBV7FfRT1qSajTxaEYyOhs/pub?gid=1358673506&single=true&output=csv"
-
+URL_VENTORY = os.environ.get("URL_VENTORY", "https://docs.google.com/spreadsheets/d/e/2PACX-1vSXxqrGGs4_mU4n511v3zBkKo4buAFv0TwrlrrX4XD2jFjIT7cC8kvH7ER32Ye2hiOpo3mAFsUkyydg/pub?gid=22270598&single=true&output=csv")
+URL_RH      = os.environ.get("URL_RH",      "https://docs.google.com/spreadsheets/d/e/2PACX-1vSXxqrGGs4_mU4n511v3zBkKo4buAFv0TwrlrrX4XD2jFjIT7cC8kvH7ER32Ye2hiOpo3mAFsUkyydg/pub?gid=241856834&single=true&output=csv")
 ventory = pd.read_csv(URL_VENTORY)
 rh      = pd.read_csv(URL_RH)
-mf      = pd.read_csv(URL_MF)
+_MF_CSV = Path(os.environ.get("MF_CSV_PATH", r"C:\Users\developer2\Documents\vpncompartido\BD_Ventas_AUREN.csv"))
+_mf_raw = pd.read_csv(_MF_CSV, encoding="utf-8-sig", low_memory=False)
+# La columna AÑO_REG puede tener la ñ corrupta según el encoding del CSV
+_col_anio_mf = next((c for c in _mf_raw.columns if "O_REG" in c and c != "MES_REG"), "AÑO_REG")
+_mf_raw = _mf_raw.rename(columns={_col_anio_mf: "AÑO_REG"})
+_mf_raw["FILIAL"] = _mf_raw["FILIAL"].str.upper().str.strip()
+_mf_raw.loc[_mf_raw["FILIAL"].str.contains("ANCASH",      na=False), "FILIAL"] = "CHIMBOTE"
+_mf_raw.loc[_mf_raw["FILIAL"].str.contains("LA LIBERTAD", na=False), "FILIAL"] = "TRUJILLO"
+mf = _mf_raw[_mf_raw["ESTADO ORDEN SERVICIO 2"].str.strip() == "LIQUIDADA"].copy()
+mf_ventas = _mf_raw.copy()   # todas las filas sin filtro de estado
+
+# ── Google Sheet MiFibra (fuente secundaria, acceso autenticado) ──
+# Se descarga la hoja "MiFibra" del Sheet privado y se combina con
+# el CSV local para enriquecer ALTAS.MF con ventas adicionales.
+_MF_SHEET_ID = os.environ.get("MF_SHEET_ID", "")
+_mf_sheet_df = pd.DataFrame()
+if _MF_SHEET_ID:
+    try:
+        import io
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        from googleapiclient.discovery import build
+
+        _token_path = Path(__file__).parent / "token.json"
+        _creds_path = Path(__file__).parent / "credentials.json"
+        _mf_scopes  = [
+            "https://www.googleapis.com/auth/drive.readonly",
+            "https://www.googleapis.com/auth/spreadsheets.readonly",
+        ]
+        _mf_creds = None
+        if _token_path.exists():
+            _mf_creds = Credentials.from_authorized_user_file(str(_token_path))
+        if _mf_creds and _mf_creds.expired and _mf_creds.refresh_token:
+            _mf_creds.refresh(Request())
+
+        if _mf_creds and _mf_creds.valid:
+            _sheets_svc = build("sheets", "v4", credentials=_mf_creds)
+            _resp = (
+                _sheets_svc.spreadsheets().values()
+                .get(spreadsheetId=_MF_SHEET_ID, range="MiFibra")
+                .execute()
+            )
+            _vals = _resp.get("values", [])
+            if len(_vals) > 1:
+                _mf_sheet_df = pd.DataFrame(_vals[1:], columns=_vals[0])
+                print(f"[OK] MiFibra Sheet: {len(_mf_sheet_df)} filas descargadas")
+            else:
+                print("[AVISO] MiFibra Sheet: hoja vacia o sin datos")
+        else:
+            print("[AVISO] MiFibra Sheet: credenciales no disponibles, se omite fuente secundaria")
+    except Exception as _e_mf_sheet:
+        print(f"[AVISO] MiFibra Sheet no disponible: {_e_mf_sheet}")
 
 hist = pd.read_excel(Path(__file__).parent / "altas_historico.xlsx")
 hist["dnivdd"] = pd.to_numeric(hist["dnivdd"], errors="coerce").astype("Int64")
@@ -932,7 +1224,7 @@ df["SUP1"]           = ""
 # 7. JOIN LCF → RIESG
 # ══════════════════════════════════════════════════════════════
 
-URL_LCF = "https://docs.google.com/spreadsheets/d/e/2PACX-1vR_9W58TW-lTrt6_sb4bSgWKkfdcYGV0KXjxKwps0l3qOLGz3MR_eA27hnbAFmBegu85U9jzG5yqe9v/pub?gid=1443303762&single=true&output=csv"
+URL_LCF = os.environ.get("URL_LCF", "https://docs.google.com/spreadsheets/d/e/2PACX-1vR_9W58TW-lTrt6_sb4bSgWKkfdcYGV0KXjxKwps0l3qOLGz3MR_eA27hnbAFmBegu85U9jzG5yqe9v/pub?gid=1443303762&single=true&output=csv")
 
 lcf = pd.read_csv(URL_LCF)
 lcf["PETICION"] = pd.to_numeric(lcf["PETICION"], errors="coerce").astype("Int64")
@@ -1026,11 +1318,18 @@ dias_totales   = len(pd.bdate_range(inicio_mes, fin_mes))
 col_m1 = "altas_" + (inicio_mes - pd.DateOffset(months=1)).strftime("%Y%m")
 col_m2 = "altas_" + (inicio_mes - pd.DateOffset(months=2)).strftime("%Y%m")
 
-# ── Cuotas por vendedor (opcional: cuotas.xlsx con cols DNI, CUOTA) ─
+# ── Cuotas por vendedor (opcional: cuotas.xlsx con cols PERIODO, DNI, CUOTA) ─
 path_cuotas = Path(__file__).parent / "cuotas.xlsx"
 if path_cuotas.exists():
-    cuotas_df = pd.read_excel(path_cuotas)[["DNI", "CUOTA"]]
-    cuotas_df["DNI"] = pd.to_numeric(cuotas_df["DNI"], errors="coerce").astype("Int64")
+    _cuotas_raw = pd.read_excel(path_cuotas)
+    _cuotas_raw["DNI"] = pd.to_numeric(_cuotas_raw["DNI"], errors="coerce").astype("Int64")
+    if "PERIODO" in _cuotas_raw.columns:
+        _cuotas_raw["PERIODO"] = _cuotas_raw["PERIODO"].astype(str).str.strip()
+        cuotas_df = _cuotas_raw[_cuotas_raw["PERIODO"] == PERIODO][["DNI", "CUOTA"]]
+        if cuotas_df.empty:
+            print(f"AVISO: cuotas.xlsx no tiene filas para el periodo {PERIODO} — columna CUOTA será 0")
+    else:
+        cuotas_df = _cuotas_raw[["DNI", "CUOTA"]]
 else:
     print("AVISO: cuotas.xlsx no encontrado — columna CUOTA será 0")
     cuotas_df = pd.DataFrame({"DNI": pd.array([], dtype="Int64"), "CUOTA": pd.array([], dtype=float)})
@@ -1232,29 +1531,6 @@ _base_rt = df_rt.sort_values("DNI_VENDEDOR", kind="stable").reset_index(drop=Tru
 cols_presentes_rt = [c for c in COLS_ORDER if c != "ORDEN" and c in _base_rt.columns]
 rt_df = _base_rt[cols_presentes_rt]
 
-# ════════════════════════════════════════════════════════════
-# VDD2 — altas diarias por vendedor
-# ════════════════════════════════════════════════════════════
-pivot_diario = (
-    df.assign(d=df["Fecha_de_alta"].dt.date)
-    .groupby(["DNI_VENDEDOR", "d"]).size()
-    .unstack(fill_value=0)
-)
-pivot_diario.columns  = [pd.Timestamp(c) for c in pivot_diario.columns]
-pivot_diario.index    = pivot_diario.index.astype("Int64")
-
-vdd2 = rh_base.merge(
-    pivot_diario.reset_index().rename(columns={"DNI_VENDEDOR": "DNI"}),
-    on="DNI", how="left"
-)
-date_cols_v2 = sorted([c for c in vdd2.columns if isinstance(c, pd.Timestamp)])
-for c in date_cols_v2:
-    vdd2[c] = vdd2[c].fillna(0).astype(int)
-vdd2["Total general"] = vdd2[date_cols_v2].sum(axis=1)
-vdd2 = vdd2[
-    ["ZONAL", "SUPERVISOR", "DNI", "VENDEDOR", "ESQUEMA", "ANTIG", "F_INGRESO"]
-    + date_cols_v2 + ["Total general"]
-].sort_values(["ZONAL", "SUPERVISOR", "VENDEDOR"]).reset_index(drop=True)
 
 # ════════════════════════════════════════════════════════════
 # VDD1 — resumen por vendedor
@@ -1270,21 +1546,75 @@ agg_altas = (
     .assign(DNI=lambda d: d["DNI"].astype("Int64"))
 )
 
-# Tabla MF (nueva fuente): filtrar por MES_INGRESO del período
-# ALTAS.MF = count de DNI VDD (cada fila = 1 instalada)
-_mes_num = int(PERIODO.split("-")[1])
+# Tabla MF — combinar CSV local + Google Sheet, filtrar por período
+# ALTAS.MF = conteo de instalaciones únicas por DNI vendedor
+_mes_num  = int(PERIODO.split("-")[1])
 _anio_num = int(PERIODO.split("-")[0])
 mf_filt = mf[
-    (mf["MES_INGRESO"] == _mes_num) &
-    (mf["AÑO_INGRESO"] == _anio_num)
+    (mf["MES_REG"] == _mes_num) &
+    (mf["AÑO_REG"] == _anio_num)
 ].copy()
-mf_norm = (
-    mf_filt.groupby("DNI VDD", as_index=False)
-    .size()
-    .rename(columns={"DNI VDD": "DNI", "size": "ALTAS.MF"})
-)
-mf_norm["DNI"] = pd.to_numeric(mf_norm["DNI"], errors="coerce").astype("Int64")
+mf_filt_ventas = mf_ventas[
+    (mf_ventas["MES_REG"] == _mes_num) &
+    (mf_ventas["AÑO_REG"] == _anio_num)
+].copy()
 
+# Construir tabla de ventas desde CSV (una fila = una instalación)
+_mf_csv_ventas = mf_filt[["NUM DOC", "FECHA DE INSTALACION", "MES_REG"]].copy()
+_mf_csv_ventas = _mf_csv_ventas.rename(columns={
+    "NUM DOC":             "DNI",
+    "FECHA DE INSTALACION": "FECHA_INST",
+    "MES_REG":             "MES_VENTA",
+})
+
+# Construir tabla de ventas desde Google Sheet (si está disponible)
+_mf_gs_ventas = pd.DataFrame()
+if not _mf_sheet_df.empty:
+    try:
+        # Detectar columnas clave por nombre (tolerante a variaciones)
+        _col_dni  = next((c for c in _mf_sheet_df.columns if "DOC" in c.upper()), None)
+        _col_fech = next((c for c in _mf_sheet_df.columns if "INSTALAC" in c.upper()), None)
+        _col_mes  = next((c for c in _mf_sheet_df.columns if "MES" in c.upper() and "VENTA" in c.upper()), None)
+        if _col_dni and _col_fech:
+            _tmp = _mf_sheet_df[[_col_dni, _col_fech] + ([_col_mes] if _col_mes else [])].copy()
+            _tmp = _tmp.rename(columns={_col_dni: "DNI", _col_fech: "FECHA_INST"})
+            if _col_mes:
+                _tmp = _tmp.rename(columns={_col_mes: "MES_VENTA"})
+                _tmp["MES_VENTA"] = pd.to_numeric(_tmp["MES_VENTA"], errors="coerce")
+                _tmp = _tmp[_tmp["MES_VENTA"] == _mes_num]
+            else:
+                # Derivar mes desde FECHA_INST si no hay columna MES_VENTA
+                _tmp["FECHA_INST"] = pd.to_datetime(_tmp["FECHA_INST"], errors="coerce", dayfirst=True)
+                _tmp["MES_VENTA"]  = _tmp["FECHA_INST"].dt.month
+                _tmp = _tmp[_tmp["MES_VENTA"] == _mes_num]
+                # Filtrar también por año
+                _tmp = _tmp[_tmp["FECHA_INST"].dt.year == _anio_num]
+            _mf_gs_ventas = _tmp[["DNI", "FECHA_INST", "MES_VENTA"]].copy()
+            print(f"[OK] MiFibra Sheet filtrado: {len(_mf_gs_ventas)} ventas del periodo {PERIODO}")
+        else:
+            print("[AVISO] MiFibra Sheet: no se encontraron columnas DNI/FECHA_INSTALACION")
+    except Exception as _e_gs:
+        print(f"[AVISO] MiFibra Sheet procesamiento fallido: {_e_gs}")
+
+# Combinar ambas fuentes y deduplicar por (DNI, FECHA_INST)
+# — la clave DNI+FECHA_INST evita contar dos veces la misma instalación
+_mf_combinado = pd.concat([_mf_csv_ventas, _mf_gs_ventas], ignore_index=True)
+_mf_combinado["DNI"] = pd.to_numeric(_mf_combinado["DNI"], errors="coerce").astype("Int64")
+_mf_combinado["FECHA_INST"] = pd.to_datetime(_mf_combinado["FECHA_INST"], errors="coerce", dayfirst=True)
+_mf_combinado = _mf_combinado.drop_duplicates(subset=["DNI", "FECHA_INST"])
+
+mf_norm = (
+    _mf_combinado.groupby("DNI", as_index=False)
+    .size()
+    .rename(columns={"size": "ALTAS.MF"})
+)
+mf_norm["DNI"] = mf_norm["DNI"].astype("Int64")
+print(f"[OK] ALTAS.MF combinado: {mf_norm['ALTAS.MF'].sum()} instalaciones, {len(mf_norm)} vendedores")
+
+for _col in (col_m1, col_m2):
+    if _col not in hist.columns:
+        print(f"AVISO: columna '{_col}' no encontrada en altas_historico.xlsx — se usara 0")
+        hist[_col] = 0
 hist_m = hist[["dnivdd", col_m1, col_m2]].rename(
     columns={"dnivdd": "DNI", col_m1: "ALTAS_M-1", col_m2: "ALTAS_M-2"}
 )
@@ -1418,19 +1748,54 @@ _path_czsup = Path(__file__).parent / "cuotas_zonal_sup.xlsx"
 _cz_zon = pd.read_excel(_path_czsup, sheet_name="ZONAL")
 _cz_sup = pd.read_excel(_path_czsup, sheet_name="SUPERVISOR")
 
-# Columna de cuota: la segunda columna numérica (CUOTA_ABRIL, CUOTA_MAYO, etc.)
-_cuota_col_zon = [c for c in _cz_zon.columns if c != "ZONAL"][0]
-_cuota_col_sup = [c for c in _cz_sup.columns if c not in ("ZONAL", "SUPERVISOR")][0]
+# Filtrar por periodo si la columna existe
+if "PERIODO" in _cz_zon.columns:
+    _cz_zon["PERIODO"] = _cz_zon["PERIODO"].astype(str).str.strip()
+    _cz_zon = _cz_zon[_cz_zon["PERIODO"] == PERIODO].copy()
+if "PERIODO" in _cz_sup.columns:
+    _cz_sup["PERIODO"] = _cz_sup["PERIODO"].astype(str).str.strip()
+    _cz_sup = _cz_sup[_cz_sup["PERIODO"] == PERIODO].copy()
+
+# Columna de cuota zonal: preferir CUOTA_MOVISTAR, si no existe tomar la primera numérica
+if "CUOTA_MOVISTAR" in _cz_zon.columns:
+    _cuota_col_zon = "CUOTA_MOVISTAR"
+else:
+    _cuota_col_zon = [c for c in _cz_zon.columns if c not in ("PERIODO", "ZONAL")][0]
+
+# Columna de cuota supervisor: primera columna que no sea PERIODO, ZONAL ni SUPERVISOR
+if "CUOTA_TOTAL" in _cz_sup.columns:
+    _cuota_col_sup = "CUOTA_TOTAL"
+else:
+    _cuota_col_sup = [c for c in _cz_sup.columns if c not in ("PERIODO", "ZONAL", "SUPERVISOR")][0]
 
 # Lista cerrada de zonales y cuotas (orden del archivo)
 _tds_zonales   = _cz_zon["ZONAL"].tolist()
 _tds_cuota_zon = dict(zip(_cz_zon["ZONAL"], _cz_zon[_cuota_col_zon].fillna(0).astype(int)))
 
 # Lista cerrada de supervisores con ZONAL, CUOTA (total), CUOTA_REG y CUOTA_FLEX
-_tds_sup_rows  = (_cz_sup[["ZONAL", "SUPERVISOR", _cuota_col_sup, "CUOTA_REG", "CUOTA_FLEX"]]
-                  .rename(columns={_cuota_col_sup: "CUOTA"})
-                  .fillna(0)
-                  .reset_index(drop=True))
+# La columna CUOTA_REG puede llamarse CUOTA_REGULA segun version del archivo
+_col_reg  = "CUOTA_REG"  if "CUOTA_REG"  in _cz_sup.columns else \
+            "CUOTA_REGULA" if "CUOTA_REGULA" in _cz_sup.columns else None
+_col_flex = "CUOTA_FLEX" if "CUOTA_FLEX" in _cz_sup.columns else None
+
+_sup_cols = ["ZONAL", "SUPERVISOR", _cuota_col_sup]
+if _col_reg:
+    _sup_cols.append(_col_reg)
+else:
+    _cz_sup["CUOTA_REG"] = 0
+    _col_reg = "CUOTA_REG"
+    _sup_cols.append(_col_reg)
+if _col_flex:
+    _sup_cols.append(_col_flex)
+else:
+    _cz_sup["CUOTA_FLEX"] = 0
+    _col_flex = "CUOTA_FLEX"
+    _sup_cols.append(_col_flex)
+
+_tds_sup_rows = (_cz_sup[_sup_cols]
+                 .rename(columns={_cuota_col_sup: "CUOTA", _col_reg: "CUOTA_REG", _col_flex: "CUOTA_FLEX"})
+                 .fillna(0)
+                 .reset_index(drop=True))
 
 # ════════════════════════════════════════════════════════════
 # EXPORTAR — libro Excel multi-hoja
@@ -1695,7 +2060,7 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
 
         Bc = f"B{r}"; Cc = f"C{r}"; Dc = f"D{r}"
         _set(ws_tds, r, column_index_from_string("D"),
-             f'=SUMIFS(Tbl_ALTAS[Q],Tbl_ALTAS[RIESG],0,Tbl_ALTAS[zonal],TDS!${Bc})',
+             f'=SUMIFS(Tbl_ALTAS[Q],Tbl_ALTAS[RIESG],0,Tbl_ALTAS[zonal2],TDS!${Bc})',
              font=_f(size=11), aln=_aln("center","center"), fmt="#,##0", border=bdr)
         _set(ws_tds, r, column_index_from_string("E"),
              f'=+TDS!${Dc}/TDS!${Cc}',
@@ -1705,11 +2070,11 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
             col_idx = column_index_from_string(col_l)
             head_ref = f"{col_l}$5"
             _set(ws_tds, r, col_idx,
-                 f'=SUMIFS(Tbl_ALTAS[Q],Tbl_ALTAS[RIESG],0,Tbl_ALTAS[Fecha_Alta],TDS!{head_ref},Tbl_ALTAS[zonal],TDS!${Bc})',
+                 f'=SUMIFS(Tbl_ALTAS[Q],Tbl_ALTAS[RIESG],0,Tbl_ALTAS[Fecha_Alta],TDS!{head_ref},Tbl_ALTAS[zonal2],TDS!${Bc})',
                  font=_f(size=11), aln=_aln("center","center"), border=bdr)
         # M AXB/FXS
         _set(ws_tds, r, column_index_from_string("M"),
-             f'=SUMIFS(Tbl_ALTAS[RIESG],Tbl_ALTAS[RIESG],1,Tbl_ALTAS[zonal],TDS!${Bc})',
+             f'=SUMIFS(Tbl_ALTAS[RIESG],Tbl_ALTAS[RIESG],1,Tbl_ALTAS[zonal2],TDS!${Bc})',
              font=_f(bold=True, size=11), aln=_aln("center","center"), fmt="#,##0", border=bdr)
         # N %PROY
         _set(ws_tds, r, column_index_from_string("N"),
@@ -1730,11 +2095,11 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
              font=_f(size=11), aln=_aln("center","center"), fmt="#,##0.0", border=bdr)
         # R %Conver
         _set(ws_tds, r, column_index_from_string("R"),
-             f'=IFERROR({Dc}/SUMIF(Tbl_RT[zonal],TDS!{Bc},Tbl_RT[Q]),"")',
+             f'=IFERROR({Dc}/SUMIF(Tbl_RT[zonal2],TDS!{Bc},Tbl_RT[Q]),"")',
              font=_f(bold=True, size=11), aln=_aln("center","center"), fmt="0%", border=bdr)
         # S %FLEX
         _set(ws_tds, r, column_index_from_string("S"),
-             f'=IFERROR(SUMIFS(Tbl_ALTAS[Q],Tbl_ALTAS[zonal],TDS!${Bc},Tbl_ALTAS[Scoring],"FLEX")/{Dc},"-")',
+             f'=IFERROR(SUMIFS(Tbl_ALTAS[Q],Tbl_ALTAS[zonal2],TDS!${Bc},Tbl_ALTAS[Scoring],"FLEX")/{Dc},"-")',
              font=_f(size=11), aln=_aln("center","center"), fmt="0%", border=bdr)
         # T Altas pendientes
         _set(ws_tds, r, column_index_from_string("T"),
@@ -2078,10 +2443,10 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
     _c_b15 = ws_tds.cell(row=_r_tot + 2, column=column_index_from_string("B"))
     _c_b15.font = Font(name=_FNT, size=11, bold=True, italic=True, color="0000FF")
 
-    # ── Y17 — negrita cursiva azul #0000FF ───────────────────────────
+    # ── Y17 — formato normalizado (sin cursiva, sin color especial) ──
     _r_b15_y17 = _r_tot + 4
     _c_y17 = ws_tds.cell(row=_r_b15_y17, column=column_index_from_string("Y"))
-    _c_y17.font = Font(name=_FNT, size=11, bold=True, italic=True, color="0000FF")
+    _c_y17.font = Font(name=_FNT, size=11, bold=False, italic=False, color="000000")
 
     # ── Y5:AT5 — borde inferior negro ───────────────────────────────
     for _cl_idx in range(column_index_from_string("Y"), column_index_from_string("AT") + 1):
@@ -2095,11 +2460,28 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
             right=_existing.right if _existing.right and _existing.right.style else None,
         )
 
-    # ── Y16:AT16 — borde inferior ────────────────────────────────────
+    # ── Y16:AT16 — sin borde inferior ────────────────────────────────
     _r_y16 = _r_tot + 3
     for _cl_idx in range(column_index_from_string("Y"), column_index_from_string("AT") + 1):
         _c = ws_tds.cell(row=_r_y16, column=_cl_idx)
-        _c.border = Border(bottom=_THIN)
+        _existing16 = _c.border
+        _c.border = Border(
+            top=_existing16.top if _existing16.top and _existing16.top.style else None,
+            left=_existing16.left if _existing16.left and _existing16.left.style else None,
+            right=_existing16.right if _existing16.right and _existing16.right.style else None,
+        )
+
+    # ── Y17:AT17 — borde inferior ────────────────────────────────────
+    _r_y17 = _r_tot + 4
+    for _cl_idx in range(column_index_from_string("Y"), column_index_from_string("AT") + 1):
+        _c = ws_tds.cell(row=_r_y17, column=_cl_idx)
+        _existing17 = _c.border
+        _c.border = Border(
+            top=_existing17.top if _existing17.top and _existing17.top.style else None,
+            bottom=_THIN,
+            left=_existing17.left if _existing17.left and _existing17.left.style else None,
+            right=_existing17.right if _existing17.right and _existing17.right.style else None,
+        )
 
     # ── AW5:BL5 — negrita y borde inferior negro (cabecera Tabla 3) ──
     for _cl_idx in range(column_index_from_string("AW"), column_index_from_string("BL") + 1):
@@ -2152,7 +2534,6 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
     #           ESQUEMA(7) ALTAS(8) AXB/FXS(9) ALTAS_NETAS(10) CLUSTER.ALTAS(11)
     #           REG_TOT(12) %Conver(13) RATIO_CON(14) PROYECT.ALT(15) CUOTA(16)
     #           PROY_VS_CUOTA(17) ALTAS_M-1(18) ALTAS_M-2(19) ALTAS.MF(20) OBSERVACIONES(21)
-    # Referencia: AVANCE_2026-04-16v5.xlsx
     _V1_HDR = {
         # col: (fgColor, font_color)
         1:  ("4472C4", "FFFFFF"),   # ZONAL          — azul
@@ -2238,95 +2619,22 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
                    fill=PatternFill("solid", fgColor="FFC7CE"))
     )
 
-    # ── VDD2: encabezado + tabla ─────────────────────────────
-    vdd2.to_excel(writer, sheet_name="VDD2", index=False, startrow=3)
-    ws_v2 = writer.sheets["VDD2"]
-    ws_v2["A1"] = "feedback_rh"
-    ws_v2["B1"] = "EN CAMPO"
-    ws_v2["A3"] = "ALTAS"
-
-    # ── Formato VDD2 ──────────────────────────────────────────
-    _v2_nrows = len(vdd2)
-    _v2_ncols = len(vdd2.columns)
-    _v2_col_names = list(vdd2.columns)
-    _HDR_ROW_V2 = 4   # startrow=3 → encabezados en fila 4 (1-based), datos desde fila 5
-
-    # Estilo de encabezados: fondo #156082, fuente blanca, negrita, centrado
-    _fill_v2_hdr  = PatternFill("solid", fgColor="156082")
-    _font_v2_hdr  = Font(name="Aptos Narrow", size=11, bold=True, color="FFFFFF")
-    _aln_center   = Alignment(horizontal="center", vertical="center")
-    _aln_left     = Alignment(horizontal="left",   vertical="center")
-    _thin_blk     = Side(style="thin", color="000000")
-    _bdr_all_blk  = Border(
-        left=_thin_blk, right=_thin_blk, top=_thin_blk, bottom=_thin_blk
-    )
-
-    # Identificar columna F_INGRESO y columnas de fecha (Timestamps)
-    _v2_fi_colidx   = None   # índice 1-based de F_INGRESO
-    _v2_date_colidxs = []    # índices 1-based de columnas de fecha (pivot días)
-    for _ci, _cname in enumerate(_v2_col_names, start=1):
-        if _cname == "F_INGRESO":
-            _v2_fi_colidx = _ci
-        elif isinstance(_cname, pd.Timestamp):
-            _v2_date_colidxs.append(_ci)
-
-    # Encabezados: formato + bordes
-    for _ci in range(1, _v2_ncols + 1):
-        _cell = ws_v2.cell(row=_HDR_ROW_V2, column=_ci)
-        _cell.fill   = _fill_v2_hdr
-        _cell.font   = _font_v2_hdr
-        _cell.border = _bdr_all_blk
-        # Formato personalizado "ddd dd" para columnas de fecha en encabezado
-        if isinstance(_v2_col_names[_ci - 1], pd.Timestamp):
-            _cell.number_format = "ddd dd"
-            _cell.alignment = _aln_center
-        else:
-            _cell.alignment = _aln_center
-
-    # Datos: bordes en todas las celdas + formatos especiales
-    for _row_i in range(_HDR_ROW_V2 + 1, _HDR_ROW_V2 + _v2_nrows + 1):
-        for _ci in range(1, _v2_ncols + 1):
-            _cell = ws_v2.cell(row=_row_i, column=_ci)
-            _cell.border = _bdr_all_blk
-            # F_INGRESO → dd/mm/yyyy
-            if _ci == _v2_fi_colidx:
-                _cell.number_format = "dd/mm/yyyy"
-                _cell.alignment = _aln_center
-
-    # Autoajuste de ancho para columnas de fecha (pivot días) y Total general
-    _v2_total_colidx = _v2_ncols  # "Total general" es la última columna
-    for _ci in _v2_date_colidxs + [_v2_total_colidx]:
-        _col_ltr = get_column_letter(_ci)
-        # Calcular ancho máximo: encabezado "ddd dd" tiene ~6 chars; datos son enteros
-        _max_w = max(
-            len("ddd dd") + 1,
-            max((len(str(ws_v2.cell(row=_r, column=_ci).value or ""))
-                 for _r in range(_HDR_ROW_V2 + 1, _HDR_ROW_V2 + _v2_nrows + 1)),
-                default=4)
-        )
-        ws_v2.column_dimensions[_col_ltr].width = _max_w + 1
-
-    # A3 — fondo amarillo, negrita, centrado
-    ws_v2["A3"].fill      = PatternFill("solid", fgColor="FFFF00")
-    ws_v2["A3"].font      = Font(name="Aptos Narrow", size=11, bold=True)
-    ws_v2["A3"].alignment = _aln_center
-
-    # ── Hoja MiFibra ──────────────────────────────────────────────────────
-    # Tres tablas tipo pivot (rangos con formato) a partir de mf_filt.
-    # Estructura según imagen:
-    #   T1 (A1): filas=fechaInscripcionFicha (día-mes), cols=FILIAL,  vals=sum(Q)
-    #   T2 (F1): filas=FILIAL,                          cols=PORTA,   vals=sum(Q)
-    #   T3 (K1): filas=FILIAL+RENTA MENSUAL,            cols=PORTA,   vals=sum(Q)
-    # Separación: 2 columnas en blanco entre tablas.
+    # ── Hoja MiFibra ─────────────────────────────────────────────────────────
+    # Layout según modelo EJM_HOJA_MIFIBRA.xlsx:
+    #   Col A : VENTAS        — todos los registros, filas=día, cols=filial fija
+    #   Col I : INSTALADAS    — solo LIQUIDADAS,     filas=día, cols=filial fija
+    #   Col R : INSTALADAS por PLAN — INSTALADAS por filial+plan, cols=PORTA
+    # Columnas fijas de filial: AREQUIPA, CHIMBOTE, LIMA, TRUJILLO (0 si no hay datos)
+    # Separadores: G-H vacías entre VENTAS e INSTALADAS; O-Q vacías entre INSTALADAS y PLAN
 
     ws_mf = writer.book.create_sheet("MiFibra")
     ws_mf.sheet_view.showGridLines = False
 
     _FNT_MF   = "Aptos Narrow"
-    _BLUE_HDR = "156082"   # fondo cabecera azul oscuro
+    _BLUE_HDR = "156082"
     _WHITE    = "FFFFFF"
-    _GRAY_ROW = "D9E1F2"   # fila total / subtotal
-    _BLUE_LGT = "DEEAF1"   # fila alternada opcional
+    _GRAY_ROW = "D9E1F2"
+    _YELLOW   = "FFFF00"
 
     def _mf_fill(rgb):
         return PatternFill("solid", fgColor=rgb)
@@ -2342,34 +2650,75 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
         return Border(left=_THIN_MF, right=_THIN_MF,
                       top=_THIN_MF, bottom=_THIN_MF)
 
-    def _write_pivot_range(ws, start_row, start_col, df_pivot, title_label):
-        """
-        Escribe un pivot (DataFrame con totales) en la hoja ws a partir de
-        (start_row, start_col). Devuelve la cantidad de filas escritas.
-        Encabezado: fondo azul oscuro, fuente blanca.
-        Filas de datos: sin fondo (blanco).
-        Fila Total: fondo gris claro, negrita.
-        """
-        cols = list(df_pivot.columns)   # primera col = etiqueta fila
-        n_cols = len(cols)
-        r = start_row
-        c0 = start_col
+    # Columnas de filial fijas — siempre presentes aunque no haya datos
+    _MF_FILIALES = ["AREQUIPA", "CHIMBOTE", "LIMA", "TRUJILLO"]
+    _DIAS_ES = {0:"lun",1:"mar",2:"mié",3:"jue",4:"vie",5:"sáb",6:"dom"}
 
-        # ── Fila de encabezados ──────────────────────────────────────────
-        for ci, col_name in enumerate(cols):
-            cell = ws.cell(row=r, column=c0 + ci, value=str(col_name))
-            cell.fill      = _mf_fill(_BLUE_HDR)
-            cell.font      = _mf_font(bold=True, color=_WHITE)
+    def _preparar_pivot_dia(df_src, col_fecha="FECHA DE VENTA"):
+        """Pivot filas=día, cols=filiales fijas, + fila Total general."""
+        work = df_src.copy()
+        work["_fecha"] = pd.to_datetime(
+            work[col_fecha], dayfirst=True, errors="coerce"
+        )
+        work["_dia_label"] = work["_fecha"].apply(
+            lambda d: f"{_DIAS_ES[d.weekday()]} {d.day:02d}" if pd.notna(d) else ""
+        )
+        work["_dia_orden"] = work["_fecha"].dt.day
+        work["Q"] = 1
+
+        if work.empty:
+            piv = pd.DataFrame(columns=["FECHA"] + _MF_FILIALES + ["Total general"])
+            tot = pd.DataFrame([["Total general"] + [0]*len(_MF_FILIALES) + [0]],
+                               columns=piv.columns)
+            return pd.concat([piv, tot], ignore_index=True)
+
+        piv = work.pivot_table(
+            index=["_dia_orden", "_dia_label"], columns="FILIAL",
+            values="Q", aggfunc="count", fill_value=0
+        ).reset_index()
+        piv.columns.name = None
+        piv = piv.drop(columns="_dia_orden").rename(columns={"_dia_label": "FECHA"})
+
+        # Garantizar columnas fijas (rellenar 0 si la filial no tuvo datos)
+        for _fc in _MF_FILIALES:
+            if _fc not in piv.columns:
+                piv[_fc] = 0
+        piv = piv[["FECHA"] + _MF_FILIALES]
+
+        # Fila Total general
+        tot_vals = {c: piv[c].sum() for c in _MF_FILIALES}
+        tot_vals["FECHA"] = "Total general"
+        piv = pd.concat([piv, pd.DataFrame([tot_vals])], ignore_index=True)
+        piv["Total general"] = piv[_MF_FILIALES].sum(axis=1)
+        return piv
+
+    def _escribir_tabla_dia(ws, start_row, c0, df_piv, titulo):
+        """Escribe tabla de días en ws desde (start_row, c0).
+        Fila start_row-1 lleva el título. Devuelve nro de fila del Total general."""
+        # Título
+        t = ws.cell(row=start_row - 1, column=c0, value=titulo)
+        t.font = _mf_font(bold=True)
+        t.alignment = _mf_aln("left")
+
+        cols = list(df_piv.columns)
+        r = start_row
+        # Encabezado
+        for ci, col in enumerate(cols):
+            cell = ws.cell(row=r, column=c0 + ci, value=col)
+            cell.fill = _mf_fill(_BLUE_HDR)
+            cell.font = _mf_font(bold=True, color=_WHITE)
             cell.alignment = _mf_aln("center")
-            cell.border    = _mf_bdr()
+            cell.border = _mf_bdr()
         r += 1
 
-        # ── Filas de datos + Total ────────────────────────────────────────
-        for row_vals in df_pivot.itertuples(index=False):
-            is_total = str(row_vals[0]).strip().lower() in ("total", "total general")
+        fila_total = None
+        for row_vals in df_piv.itertuples(index=False):
+            is_total = str(row_vals[0]).strip().lower() == "total general"
+            if is_total:
+                fila_total = r
             for ci, val in enumerate(row_vals):
                 cell = ws.cell(row=r, column=c0 + ci, value=val)
-                cell.border    = _mf_bdr()
+                cell.border = _mf_bdr()
                 cell.alignment = _mf_aln("right" if ci > 0 else "left")
                 if is_total:
                     cell.fill = _mf_fill(_GRAY_ROW)
@@ -2377,205 +2726,119 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
                 else:
                     cell.font = _mf_font()
             r += 1
+        return fila_total, r  # fila_total y próxima fila libre
 
-        return r - start_row   # total filas escritas (encabezado + datos)
+    def _escribir_proyectado(ws, fila_proy, fila_total, c0, n_filiales):
+        """Escribe la fila PROYECTADO referenciando TDS para días lab."""
+        lbl = ws.cell(row=fila_proy, column=c0, value="PROYECTADO")
+        lbl.fill = _mf_fill(_YELLOW)
+        lbl.font = _mf_font(bold=True)
+        lbl.alignment = _mf_aln("left")
+        lbl.border = _mf_bdr()
+        # Una celda por filial
+        for i in range(n_filiales):
+            col_h = c0 + 1 + i
+            col_l = get_column_letter(col_h)
+            tot_cell = f"{col_l}{fila_total}"
+            formula = f"=ROUND(({tot_cell}/TDS!$B${_r_param})*TDS!$D${_r_param},0)"
+            c = ws.cell(row=fila_proy, column=col_h, value=formula)
+            c.fill = _mf_fill(_YELLOW); c.font = _mf_font(bold=True)
+            c.alignment = _mf_aln("right"); c.border = _mf_bdr()
+        # Total general de PROYECTADO = suma de filiales
+        col_tot = c0 + 1 + n_filiales
+        refs = "+".join(get_column_letter(c0 + 1 + i) + str(fila_proy)
+                        for i in range(n_filiales))
+        ct = ws.cell(row=fila_proy, column=col_tot, value=f"={refs}")
+        ct.fill = _mf_fill(_YELLOW); ct.font = _mf_font(bold=True)
+        ct.alignment = _mf_aln("right"); ct.border = _mf_bdr()
 
-    # ── Filtro de mes del período ─────────────────────────────────────────
-    _mf_mes_str = f"{_mes_num:02d}"   # "04" para abril
-    # Formatear fecha: "DD-Abr", "DD-May", etc.
-    _MESES_CORTO = {
-        1:"Ene",2:"Feb",3:"Mar",4:"Abr",5:"May",6:"Jun",
-        7:"Jul",8:"Ago",9:"Sep",10:"Oct",11:"Nov",12:"Dic"
+    # ── Construir datos ───────────────────────────────────────────────────
+    # VENTAS: todos los registros del mes, agrupados por FECHA DE VENTA
+    _piv_ventas = _preparar_pivot_dia(mf_filt_ventas, col_fecha="FECHA DE VENTA")
+    # INSTALADAS: solo LIQUIDADAS del mes, agrupados por FECHA DE INSTALACION
+    _piv_inst   = _preparar_pivot_dia(mf_filt,        col_fecha="FECHA DE INSTALACION")
+
+    # INSTALADAS por PLAN: INSTALADAS x FILIAL+PLAN FINAL, cols=PORTA
+    _t3_src = mf_filt.copy()
+    _t3_src["Q"] = 1
+    if not _t3_src.empty and "PLAN FINAL" in _t3_src.columns and "PORTA" in _t3_src.columns:
+        _t3_base = _t3_src.pivot_table(
+            index=["FILIAL", "PLAN FINAL"], columns="PORTA",
+            values="Q", aggfunc="count", fill_value=0
+        ).reset_index()
+        _t3_base.columns.name = None
+        _porta_cols = [c for c in _t3_base.columns if c not in ("FILIAL", "PLAN FINAL")]
+        _t3_rows = []
+        _t3_is_sub = []
+        for _filial, _grp in _t3_base.groupby("FILIAL", sort=True):
+            _sub = _grp[_porta_cols].sum()
+            _t3_rows.append({"Etiquetas de fila": _filial,
+                             **_sub.to_dict(), "Total general": int(_sub.sum())})
+            _t3_is_sub.append(True)
+            for _, dr in _grp.sort_values("PLAN FINAL").iterrows():
+                _t3_rows.append({"Etiquetas de fila": dr["PLAN FINAL"],
+                                 **{c: dr[c] for c in _porta_cols},
+                                 "Total general": int(dr[_porta_cols].sum())})
+                _t3_is_sub.append(False)
+        _t3_built = pd.DataFrame(_t3_rows)[["Etiquetas de fila"] + _porta_cols + ["Total general"]]
+        _t3_is_sub = pd.Series(_t3_is_sub)
+    else:
+        _porta_cols = ["ALTA NUEVA", "PORTA"]
+        _t3_built = pd.DataFrame(columns=["Etiquetas de fila"] + _porta_cols + ["Total general"])
+        _t3_is_sub = pd.Series(dtype=bool)
+
+    # ── Posiciones fijas según modelo ─────────────────────────────────────
+    # VENTAS: col A=1,  INSTALADAS: col I=9,  INSTALADAS por PLAN: col R=18
+    _COL_VENTAS = 1
+    _COL_INST   = 9
+    _COL_PLAN   = 18
+    _FILA_HDR   = 2   # fila 1 = título, fila 2 = encabezados
+
+    # ── Escribir VENTAS ───────────────────────────────────────────────────
+    _fila_tot_v, _next_v = _escribir_tabla_dia(ws_mf, _FILA_HDR, _COL_VENTAS,
+                                               _piv_ventas, "VENTAS")
+    _escribir_proyectado(ws_mf, _next_v, _fila_tot_v, _COL_VENTAS, len(_MF_FILIALES))
+
+    # ── Escribir INSTALADAS ───────────────────────────────────────────────
+    _fila_tot_i, _next_i = _escribir_tabla_dia(ws_mf, _FILA_HDR, _COL_INST,
+                                               _piv_inst, "INSTALADAS")
+    _escribir_proyectado(ws_mf, _next_i, _fila_tot_i, _COL_INST, len(_MF_FILIALES))
+
+    # ── Escribir INSTALADAS por PLAN ──────────────────────────────────────
+    _lbl_plan = ws_mf.cell(row=1, column=_COL_PLAN, value="INSTALADAS por PLAN")
+    _lbl_plan.font = _mf_font(bold=True)
+    _lbl_plan.alignment = _mf_aln("left")
+
+    _r_t3 = _FILA_HDR
+    _t3_cols = list(_t3_built.columns)
+    for ci, col in enumerate(_t3_cols):
+        cell = ws_mf.cell(row=_r_t3, column=_COL_PLAN + ci, value=col)
+        cell.fill = _mf_fill(_BLUE_HDR)
+        cell.font = _mf_font(bold=True, color=_WHITE)
+        cell.alignment = _mf_aln("center")
+        cell.border = _mf_bdr()
+    _r_t3 += 1
+    for row_idx, row_vals in enumerate(_t3_built.itertuples(index=False)):
+        is_sub = bool(_t3_is_sub.iloc[row_idx]) if row_idx < len(_t3_is_sub) else False
+        for ci, val in enumerate(row_vals):
+            cell = ws_mf.cell(row=_r_t3, column=_COL_PLAN + ci, value=val)
+            cell.border = _mf_bdr()
+            cell.alignment = _mf_aln("right" if ci > 0 else "left")
+            if is_sub:
+                cell.fill = _mf_fill(_GRAY_ROW)
+                cell.font = _mf_font(bold=True)
+            else:
+                cell.font = _mf_font()
+        _r_t3 += 1
+
+    # ── Anchos de columna según modelo ────────────────────────────────────
+    _mf_col_widths = {
+        "A": 19, "B": 10, "C": 10, "D": 10, "E": 10, "F": 15,  # VENTAS
+        "I": 19, "J": 10, "K": 10, "L": 10, "M": 10, "N": 15,  # INSTALADAS
+        "R": 29, "S": 12, "T": 8,  "U": 15,                     # por PLAN
     }
-    _mes_corto = _MESES_CORTO[_mes_num]
-
-    _mf_work = mf_filt.copy()
-    # Parsear fechaInscripcionFicha → fecha completa para formato "ddd dd"
-    _mf_work["_fecha"] = pd.to_datetime(
-        _mf_work["fechaInscripcionFicha"], dayfirst=True, errors="coerce"
-    )
-    # Formato "ddd dd": lun 07, mar 08, etc. (locale-independiente en español)
-    _DIAS_ES = {0:"lun",1:"mar",2:"mié",3:"jue",4:"vie",5:"sáb",6:"dom"}
-    _mf_work["_dia_label"] = _mf_work["_fecha"].apply(
-        lambda d: f"{_DIAS_ES[d.weekday()]} {d.day:02d}" if pd.notna(d) else ""
-    )
-    # Guardar fecha para ordenar filas correctamente
-    _mf_work["_dia_orden"] = _mf_work["_fecha"].dt.day
-    _mf_work["Q"] = 1  # columna auxiliar para pivots de conteo
-
-    # ── TABLA 1: filas=día (ddd dd), cols=FILIAL, vals=count ─────────────
-    _t1 = _mf_work.pivot_table(
-        index=["_dia_orden", "_dia_label"], columns="FILIAL", values="Q",
-        aggfunc="count", fill_value=0
-    ).reset_index()
-    _t1.columns.name = None
-    _t1 = _t1.drop(columns="_dia_orden")
-    # Renombrar ANCASH → CHIMBOTE en T1
-    _t1 = _t1.rename(columns={"_dia_label": "Etiquetas de fila", "ANCASH": "CHIMBOTE"})
-    _num_cols_t1 = [c for c in _t1.columns if c != "Etiquetas de fila"]
-    _t1_total = _t1[_num_cols_t1].sum().to_frame().T
-    _t1_total.insert(0, "Etiquetas de fila", "Total general")
-    _t1 = pd.concat([_t1, _t1_total], ignore_index=True)
-    _t1["Total general"] = _t1[_num_cols_t1].sum(axis=1)
-
-    # ── TABLA 2: filas=FILIAL, cols=PORTA, vals=count ────────────────────
-    _t2 = _mf_work.pivot_table(
-        index="FILIAL", columns="PORTA", values="Q",
-        aggfunc="count", fill_value=0
-    ).reset_index()
-    _t2.columns.name = None
-    # Renombrar ANCASH → CHIMBOTE en T2
-    _t2 = _t2.rename(columns={"FILIAL": "Etiquetas de fila"})
-    _t2["Etiquetas de fila"] = _t2["Etiquetas de fila"].replace("ANCASH", "CHIMBOTE")
-    _num_cols_t2 = [c for c in _t2.columns if c != "Etiquetas de fila"]
-    _t2_total = _t2[_num_cols_t2].sum().to_frame().T
-    _t2_total.insert(0, "Etiquetas de fila", "Total general")
-    _t2 = pd.concat([_t2, _t2_total], ignore_index=True)
-    _t2["Total general"] = _t2[_num_cols_t2].sum(axis=1)
-
-    # ── TABLA 3: filas=FILIAL (cabecera) + RENTA MENSUAL (detalle), cols=PORTA
-    # Renombrar ANCASH → CHIMBOTE en la fuente antes de construir T3
-    _mf_work["FILIAL"] = _mf_work["FILIAL"].replace("ANCASH", "CHIMBOTE")
-
-    # Objetivo: ver instaladas por FILIAL y por RENTA; fila de FILIAL = subtotal,
-    # filas de RENTA = detalle. Sin fila "Total general" al final.
-    _t3_base = _mf_work.pivot_table(
-        index=["FILIAL", "RENTA MENSUAL"], columns="PORTA", values="Q",
-        aggfunc="count", fill_value=0
-    ).reset_index()
-    _t3_base.columns.name = None
-    _porta_cols_t3 = [c for c in _t3_base.columns if c not in ("FILIAL", "RENTA MENSUAL")]
-
-    _t3_rows = []
-    for _filial, _grp in _t3_base.groupby("FILIAL", sort=True):
-        # Fila de subtotal del FILIAL (cabecera del grupo)
-        _sub = _grp[_porta_cols_t3].sum()
-        _sub_row = {"Etiquetas de fila": _filial, "_es_subtotal": True}
-        _sub_row.update(_sub.to_dict())
-        _t3_rows.append(_sub_row)
-        # Filas de detalle por RENTA MENSUAL
-        for _, dr in _grp.sort_values("RENTA MENSUAL").iterrows():
-            _det_row = {"Etiquetas de fila": dr["RENTA MENSUAL"], "_es_subtotal": False}
-            _det_row.update({c: dr[c] for c in _porta_cols_t3})
-            _t3_rows.append(_det_row)
-
-    _t3_built = pd.DataFrame(_t3_rows).reset_index(drop=True)
-    _t3_built["Total general"] = _t3_built[_porta_cols_t3].sum(axis=1)
-    _t3_is_sub = _t3_built.pop("_es_subtotal")
-    _t3_built = _t3_built[["Etiquetas de fila"] + _porta_cols_t3 + ["Total general"]]
-
-    # ── Posiciones de las 3 tablas (col inicio) ───────────────────────────
-    _LABEL_T1_COL = 1
-    _LABEL_T2_COL = len(_t1.columns) + 3        # +2 cols blanco +1
-    _LABEL_T3_COL = _LABEL_T2_COL + len(_t2.columns) + 3
-
-    # ── Títulos en fila 1: amarillo + negrita ─────────────────────────────
-    _YELLOW = "FFFF00"
-    for _lbl_col, _lbl_txt in [
-        (_LABEL_T1_COL, "INSTALADAS"),
-        (_LABEL_T2_COL, "INSTALADAS por TIPO"),
-        (_LABEL_T3_COL, "INSTALADAS por RENTA"),
-    ]:
-        _lc = ws_mf.cell(row=1, column=_lbl_col, value=_lbl_txt)
-        _lc.fill      = _mf_fill(_YELLOW)
-        _lc.font      = _mf_font(bold=True)
-        _lc.alignment = _mf_aln("left")
-
-    # ── Función de escritura especializada para T3 (subtotales en gris) ───
-    def _write_t3(ws, start_row, start_col, df_data, is_subtotal_series):
-        cols = list(df_data.columns)
-        r = start_row
-        # Encabezado
-        for ci, col_name in enumerate(cols):
-            cell = ws.cell(row=r, column=start_col + ci, value=str(col_name))
-            cell.fill      = _mf_fill(_BLUE_HDR)
-            cell.font      = _mf_font(bold=True, color=_WHITE)
-            cell.alignment = _mf_aln("center")
-            cell.border    = _mf_bdr()
-        r += 1
-        for row_idx, row_vals in enumerate(df_data.itertuples(index=False)):
-            is_sub = bool(is_subtotal_series.iloc[row_idx])
-            for ci, val in enumerate(row_vals):
-                cell = ws.cell(row=r, column=start_col + ci, value=val)
-                cell.border    = _mf_bdr()
-                cell.alignment = _mf_aln("right" if ci > 0 else "left")
-                if is_sub:
-                    cell.fill = _mf_fill(_GRAY_ROW)
-                    cell.font = _mf_font(bold=True)
-                else:
-                    cell.font = _mf_font()
-            r += 1
-
-    # ── Escribir las 3 tablas en fila 2 ───────────────────────────────────
-    _t1_filas_escritas = _write_pivot_range(ws_mf, 2, _LABEL_T1_COL, _t1, "T1")
-    _write_pivot_range(ws_mf, 2, _LABEL_T2_COL, _t2, "T2")
-    _write_t3(ws_mf, 2, _LABEL_T3_COL, _t3_built, _t3_is_sub)
-
-    # ── Fila PROYECTADO debajo del Total general de T1 ────────────────────
-    # La fila Total general es la última fila escrita por _write_pivot_range.
-    # _write_pivot_range devuelve total_filas = encabezado(1) + filas_datos.
-    # Fila de inicio de T1 = 2 (encabezado) → datos desde fila 3.
-    # Fila Total general = 2 + _t1_filas_escritas - 1
-    # Fila PROYECTADO    = 2 + _t1_filas_escritas
-    _fila_proy = 2 + _t1_filas_escritas
-
-    # Identificar columnas de T1 en la hoja:
-    # col A = "Etiquetas de fila", luego las filiales, luego "Total general"
-    # _num_cols_t1 contiene los nombres de columnas numéricas (filiales + Total general)
-    # Las columnas de filial están en _num_cols_t1[:-1], Total general en _num_cols_t1[-1]
-    _t1_all_cols  = ["Etiquetas de fila"] + list(_t1.columns[1:])  # orden real en hoja
-    _filiales_t1  = [c for c in _t1_all_cols if c not in ("Etiquetas de fila", "Total general")]
-
-    # Fila donde está el Total general (para referenciar las celdas con fórmulas)
-    _fila_totgen  = _fila_proy - 1
-
-    # Escribir etiqueta
-    _lbl = ws_mf.cell(row=_fila_proy, column=_LABEL_T1_COL, value="PROYECTADO")
-    _lbl.fill      = _mf_fill(_YELLOW)
-    _lbl.font      = _mf_font(bold=True)
-    _lbl.alignment = _mf_aln("left")
-    _lbl.border    = _mf_bdr()
-
-    # Para cada filial: =REDONDEAR((TotGen_filial / TDS!$B$_r_param) * TDS!$D$_r_param, 0)
-    _proy_col_refs = {}  # col_letra → referencia celda para sumar en Total
-    for _fi_idx, _fi_nombre in enumerate(_filiales_t1):
-        _col_hoja = _LABEL_T1_COL + 1 + _fi_idx   # col en la hoja (1-based)
-        _col_letra = get_column_letter(_col_hoja)
-        # Celda del Total general de esta filial
-        _totgen_cell = f"{_col_letra}{_fila_totgen}"
-        _formula = (
-            f"=ROUND(({_totgen_cell}/TDS!$B${_r_param})*TDS!$D${_r_param},0)"
-        )
-        _c = ws_mf.cell(row=_fila_proy, column=_col_hoja, value=_formula)
-        _c.fill      = _mf_fill(_YELLOW)
-        _c.font      = _mf_font(bold=True)
-        _c.alignment = _mf_aln("right")
-        _c.border    = _mf_bdr()
-        _proy_col_refs[_col_letra] = _c
-
-    # Columna Total general de PROYECTADO = suma de las fórmulas anteriores
-    _col_totgen_hoja = _LABEL_T1_COL + len(_t1_all_cols) - 1
-    _col_totgen_letra = get_column_letter(_col_totgen_hoja)
-    _suma_refs = "+".join(
-        f"{get_column_letter(_LABEL_T1_COL + 1 + i)}{_fila_proy}"
-        for i in range(len(_filiales_t1))
-    )
-    _ct = ws_mf.cell(row=_fila_proy, column=_col_totgen_hoja,
-                     value=f"={_suma_refs}")
-    _ct.fill      = _mf_fill(_YELLOW)
-    _ct.font      = _mf_font(bold=True)
-    _ct.alignment = _mf_aln("right")
-    _ct.border    = _mf_bdr()
-
-    # ── Autofit aproximado de columnas A hasta Q ────────────────────────────
-    for _col_cells in ws_mf.columns:
-        _col_letter = get_column_letter(_col_cells[0].column)
-        if _col_letter <= "Q":
-            _max_w = 0
-            for _cell in _col_cells:
-                if _cell.value:
-                    _max_w = max(_max_w, len(str(_cell.value)))
-            ws_mf.column_dimensions[_col_letter].width = max(_max_w + 2, 8)
+    for _col_l, _w in _mf_col_widths.items():
+        ws_mf.column_dimensions[_col_l].width = _w
 
     # ══════════════════════════════════════════════════════════════════════
     # HOJA MOVISTAR
@@ -2613,7 +2876,7 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
     _MOV_B4_BG   = "156082"; _MOV_B4_FG   = "FFFFFF"  # bloques 4: azul + blanco
 
     # Zonales en orden alfabético
-    _MOV_ZONALES = sorted(_tds_zonales)   # ['AREQUIPA','CHIMBOTE','HUARAZ','ILO','NORTE CHICO','TACNA','TRUJILLO']
+    _MOV_ZONALES = sorted(_tds_zonales)   # ['AREQUIPA','CHIMBOTE','ILO','NORTE CHICO','TACNA','TRUJILLO']
     _NZ = len(_MOV_ZONALES)
 
     # Inicio del período y mes anterior
@@ -2633,6 +2896,12 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
     _altas  = altas_df.copy()
     _rt     = rt_df.copy()
 
+    # Agregar zonal2 para que LIMA* quede agrupada como "LIMA" en los pivots
+    _altas["zonal2"] = _altas["zonal"].apply(
+        lambda z: "LIMA" if str(z).upper().startswith("LIMA") else z)
+    _rt["zonal2"] = _rt["zonal"].apply(
+        lambda z: "LIMA" if str(z).upper().startswith("LIMA") else z)
+
     # Normalizar fechas a date
     _altas["_fa"]  = pd.to_datetime(_altas["Fecha_Alta"],     errors="coerce").dt.normalize()
     _rt["_fr"]     = pd.to_datetime(_rt["Fecha_Registro"],    errors="coerce").dt.normalize()
@@ -2644,22 +2913,21 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
     # Mes anterior: usar altas_ant_df (datos SQL con PERIODO_ANT), RIESG==0
     _altas_ant_raw = altas_ant_df.copy()
     _altas_ant_raw["_fa"] = pd.to_datetime(_altas_ant_raw["Fecha_Alta"], errors="coerce").dt.normalize()
+    _altas_ant_raw["zonal2"] = _altas_ant_raw["zonal"].apply(
+        lambda z: "LIMA" if str(z).upper().startswith("LIMA") else z)
     _altas_ant = _altas_ant_raw[_altas_ant_raw["RIESG"] == 0]
 
     # ── Función: pivot diario por zonal ───────────────────────────────────
     def _pivot_dia_zon(df, date_col, val_col, agg, dias, zonales, filtro=None):
-        """Retorna DataFrame: index=día (date), columns=zonal, values=agg."""
+        """Retorna DataFrame: index=día (date), columns=zonal2, values=agg."""
         _d = df.copy()
         if filtro is not None:
             _d = _d[filtro(_d)]
-        # Normalizar nombre del campo zonal (puede ser "zonal" o "ZONAL")
-        if "ZONAL" in _d.columns and "zonal" not in _d.columns:
-            _d = _d.rename(columns={"ZONAL": "zonal"})
         _d["_dia"] = _d[date_col].dt.normalize()
         if agg == "sum":
-            _piv = _d.groupby(["_dia", "zonal"])[val_col].sum().unstack(fill_value=0)
+            _piv = _d.groupby(["_dia", "zonal2"])[val_col].sum().unstack(fill_value=0)
         elif agg == "nunique":
-            _piv = _d.groupby(["_dia", "zonal"])[val_col].nunique().unstack(fill_value=0)
+            _piv = _d.groupby(["_dia", "zonal2"])[val_col].nunique().unstack(fill_value=0)
         _piv = _piv.reindex(index=dias, columns=zonales, fill_value=0)
         return _piv
 
@@ -2919,9 +3187,7 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
     # Pivots: ALTAS TOTALES (todas RIESG==0), REGULARES (Scoring!='FLEX'), FLEX (Scoring=='FLEX')
     def _alta_pivot_dia(filtro_fn, dias):
         _d = _altas_mes[filtro_fn(_altas_mes)].copy() if filtro_fn else _altas_mes.copy()
-        if "ZONAL" in _d.columns and "zonal" not in _d.columns:
-            _d = _d.rename(columns={"ZONAL": "zonal"})
-        _p = _d.groupby([_d["_fa"].dt.normalize(), "zonal"])["Q"].sum().unstack(fill_value=0)
+        _p = _d.groupby([_d["_fa"].dt.normalize(), "zonal2"])["Q"].sum().unstack(fill_value=0)
         return _p.reindex(index=dias, columns=_MOV_ZONALES, fill_value=0)
 
     _piv_tot  = _alta_pivot_dia(None,                                      _dias_mes)
@@ -3007,9 +3273,7 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
 
     def _vel_pivot(filtro_fn, dias):
         _d = _altas_mes[filtro_fn(_altas_mes)].copy()
-        if "ZONAL" in _d.columns and "zonal" not in _d.columns:
-            _d = _d.rename(columns={"ZONAL": "zonal"})
-        _p = _d.groupby([_d["_fa"].dt.normalize(), "zonal"])["Q"].sum().unstack(fill_value=0)
+        _p = _d.groupby([_d["_fa"].dt.normalize(), "zonal2"])["Q"].sum().unstack(fill_value=0)
         return _p.reindex(index=dias, columns=_MOV_ZONALES, fill_value=0)
 
     _piv_200 = _vel_pivot(
@@ -3165,9 +3429,24 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
     writer.book.create_sheet("VDD3")
 
 
+    # ── Normalizar DEPARTAMENTO → zonal2 antes de escribir ──
+    def _normalizar_zonal2(df_src):
+        out = df_src.copy()
+        if "DEPARTAMENTO" in out.columns:
+            out = out.rename(columns={"DEPARTAMENTO": "zonal2"})
+        if "zonal2" not in out.columns:
+            out["zonal2"] = None
+        out["zonal2"] = out["zonal"].apply(
+            lambda z: "LIMA" if str(z).upper().startswith("LIMA") else z
+        )
+        return out
+
+    _rt_out    = _normalizar_zonal2(rt_df)
+    _altas_out = _normalizar_zonal2(altas_df)
+
     # ── Hojas de datos ───────────────────────────────────────
-    rt_df.to_excel(writer, sheet_name="RT", index=False)
-    altas_df.to_excel(writer, sheet_name="ALTAS", index=False)
+    _rt_out.to_excel(writer, sheet_name="RT", index=False)
+    _altas_out.to_excel(writer, sheet_name="ALTAS", index=False)
     altas_ant_df.to_excel(writer, sheet_name="ALTAS_MES_PASADO", index=False)
     writer.sheets["ALTAS_MES_PASADO"].sheet_state = "hidden"
 
@@ -3236,8 +3515,8 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
         )
         ws.add_table(tbl)
 
-    _fmt_sheet(writer.sheets["RT"],    rt_df,    "Tbl_RT",    "TableStyleLight8",  is_altas=False)
-    _fmt_sheet(writer.sheets["ALTAS"], altas_df, "Tbl_ALTAS", "TableStyleLight11", is_altas=True)
+    _fmt_sheet(writer.sheets["RT"],    _rt_out,    "Tbl_RT",    "TableStyleLight8",  is_altas=False)
+    _fmt_sheet(writer.sheets["ALTAS"], _altas_out, "Tbl_ALTAS", "TableStyleLight11", is_altas=True)
     rh.to_excel(writer, sheet_name="RH", index=False)
     ventory.to_excel(writer, sheet_name="VENTORY", index=False)
 
@@ -3320,11 +3599,12 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
     # ── Forzar fuente Aptos Narrow 11 en hojas sin formato propio ────
     # VDD1 ya tiene fuente y fills aplicados celda a celda — se excluye.
     # TDS ya fue procesada antes.
-    for _ws_name in ["VDD2", "VDD3", "RT", "ALTAS", "RH", "VENTORY"]:
+    for _ws_name in ["VDD3", "RT", "ALTAS", "RH", "VENTORY"]:
         if _ws_name in writer.sheets:
             _force_font_ws(writer.sheets[_ws_name])
 
 print(f"Archivo generado (openpyxl): {ruta}")
+import time; time.sleep(3)  # dar tiempo al OS a liberar el handle antes de que xlwings lo abra
 
 # ════════════════════════════════════════════════════════════
 # TABLAS DINÁMICAS — xlwings (requiere Excel instalado)
@@ -3332,6 +3612,7 @@ print(f"Archivo generado (openpyxl): {ruta}")
 # nativas en la hoja VDD3, apuntando a Tbl_VDD1 como origen,
 # y se vuelve a guardar.
 # ════════════════════════════════════════════════════════════
+import subprocess
 import xlwings as xw
 
 # Constantes COM para PivotTable
@@ -3451,9 +3732,60 @@ def _color_semaforo(ws_api, cell_addr, valor):
     ws_api.Range(cell_addr).Interior.Color = bgr
 
 
-app = xw.App(visible=False, add_book=False)
+def _abrir_libro_excel(ruta_str):
+    """Abre el libro en una instancia COM completamente aislada del Excel del usuario.
+
+    Usa DispatchEx en lugar de Dispatch para forzar un proceso Excel.exe nuevo
+    que no comparte ROT (Running Object Table) con instancias existentes.
+    Esto evita el error "workbook with same name already open" incluso cuando
+    el usuario tiene Excel abierto con otros archivos.
+    """
+    import pythoncom
+    import win32com.client
+
+    # CoInitialize para el hilo actual (necesario cuando viene de subprocess)
+    pythoncom.CoInitialize()
+
+    # DispatchEx crea siempre un proceso Excel nuevo y aislado (no reutiliza el del usuario)
+    xl_com = win32com.client.DispatchEx("Excel.Application")
+    xl_com.Visible = True
+    xl_com.DisplayAlerts = False
+    xl_com.AskToUpdateLinks = False
+
+    # Abrir el libro en esa instancia aislada
+    wb_com = xl_com.Workbooks.Open(
+        os.path.normpath(ruta_str),
+        UpdateLinks=False,
+        ReadOnly=False,
+    )
+
+    # Envolver en objetos xlwings para poder usar la API de alto nivel
+    app_xw = xw.App(visible=True, add_book=False)
+    # Conectar xlwings al proceso COM recién creado usando su hwnd
+    hwnd = xl_com.Hwnd
+    for candidate in xw.apps:
+        if candidate.api.Hwnd == hwnd:
+            app_xw = candidate
+            break
+    else:
+        # Si no matchea (versión xlwings antigua), usar el wrapper directo
+        app_xw.api = xl_com
+
+    app_xw.display_alerts = False
+
+    # Encontrar el libro abierto en el wrapper xlwings
+    nombre = os.path.basename(ruta_str)
+    for xw_wb in app_xw.books:
+        if xw_wb.name.lower() == nombre.lower():
+            return app_xw, xw_wb, xl_com
+
+    # Fallback: wrap manual
+    wb_xw = xw.Book(ruta_str)
+    return app_xw, wb_xw, xl_com
+
+
+app, wb, _xl_com = _abrir_libro_excel(str(ruta))
 try:
-    wb      = app.books.open(str(ruta))
     wb_api  = wb.api
     ws_vdd3 = wb.sheets["VDD3"]
     ws_vdd1 = wb.sheets["VDD1"]
@@ -3462,7 +3794,7 @@ try:
     # ── Tabla dinámica 1 — ESQUEMA: PLANILLA + PART-TIME ─────────
     # Nota: _crear_pivot usa UsedRange de VDD1 directamente (Tbl_VDD1 no existe).
     # No se crea ListObject para evitar que Excel pise el formato de openpyxl.
-    _crear_pivot(
+    pt1 = _crear_pivot(
         wb_api, ws_vdd3.api, ws_vdd1.api,
         pivot_name           = "TablaDinamica1",
         dest_cell_addr       = "A1",
@@ -3470,19 +3802,20 @@ try:
         filter_visible_items = ["PLANILLA", "PART-TIME"],
     )
 
-    # ── Tabla dinámica 2 — ANTIG: <15d + >15d (fija en A16) ──────
+    # Calcular dinámica la fila de inicio de la segunda tabla:
+    # última fila ocupada por TablaDinamica1 + 3 filas de separación
+    _pt1_last_row = pt1.TableRange2.Row + pt1.TableRange2.Rows.Count - 1
+    _pt2_start_row = _pt1_last_row + 3
+    _pt2_dest = f"A{_pt2_start_row}"
+
+    # ── Tabla dinámica 2 — ANTIG: <15d + >15d ────────────────────
     _crear_pivot(
         wb_api, ws_vdd3.api, ws_vdd1.api,
         pivot_name           = "TablaDinamica2",
-        dest_cell_addr       = "A16",
+        dest_cell_addr       = _pt2_dest,
         filter_field         = "ANTIG",
         filter_visible_items = ["<15d", ">15d"],
     )
-
-    # ── VDD3: insertar 2 filas en blanco entre las dos tablas ────
-    # Se insertan DESPUÉS de crear ambas tablas; la inserción en fila 14
-    # empuja la segunda tabla hacia abajo sin afectar su estructura.
-    ws_vdd3.api.Rows("14:15").Insert()
 
     # ── VDD3: fuente Aptos Narrow en todo el rango usado ─────────
     ws_vdd3.api.UsedRange.Font.Name = "Aptos Narrow"
@@ -3491,16 +3824,9 @@ try:
     # ── Autoajustar filas en VDD3 ────────────────────────────────
     ws_vdd3.api.UsedRange.Rows.AutoFit()
 
-    # ── VDD2: autoajuste de columnas ─────────────────────────────
-    ws_vdd2 = wb.sheets["VDD2"]
-    ws_vdd2.api.UsedRange.Columns.AutoFit()
-
-    # ── Ocultar cuadrícula VDD3 y VDD2 via SheetViews ────────────
-    # SheetViews(1) no requiere activate() ni ventana visible.
-    # Envuelto en try/except para que un fallo no interrumpa el resto.
+    # ── Ocultar cuadrícula VDD3 via SheetViews ───────────────────
     try:
         ws_vdd3.api.SheetViews(1).DisplayGridlines = False
-        ws_vdd2.api.SheetViews(1).DisplayGridlines = False
     except Exception as _e_grid:
         print(f"Aviso: no se pudo ocultar cuadrícula ({_e_grid})")
 
@@ -3529,7 +3855,22 @@ try:
     wb.sheets["TDS"].api.Activate()
 
     wb.save()
+    wb.close()
     print("Tablas dinámicas creadas, hojas reordenadas, semáforo aplicado.")
+
+    # ── Agregar hoja VDD2 (seguimiento diario) al archivo principal ──
+    try:
+        _wb_principal = _openpyxl.load_workbook(str(ruta))
+        _seg_agregar_hoja(_wb_principal, ruta, PERIODO, engine)
+        # Reordenar: VDD2 queda entre VDD1 y VDD3
+        _pnames   = _wb_principal.sheetnames
+        _idx_vdd1 = _pnames.index("VDD1") if "VDD1" in _pnames else -1
+        _idx_vdd2 = _pnames.index("VDD2")
+        _wb_principal.move_sheet("VDD2", offset=(_idx_vdd1 + 1) - _idx_vdd2)
+        _wb_principal.save(str(ruta))
+        print("[AVANCE] Hoja VDD2 (seguimiento diario) agregada al archivo principal.")
+    except Exception as _e_seg_principal:
+        print(f"[AVANCE] Aviso: no se pudo agregar hoja VDD2 al principal: {_e_seg_principal}")
 
     # ── Generar libro SEGUIMIENTO_VDD_FIJA con copia de VDD1/VDD2/VDD3 ──
     from datetime import date, timedelta
@@ -3537,10 +3878,13 @@ try:
     _fecha_str = _ayer.strftime("%d-%m-%Y")
     _ruta_seg  = _dir_salida / f"SEGUIMIENTO_VDD_FIJA_{_fecha_str}.xlsx"
 
+    # Reabrir el archivo principal con xlwings para copiar hojas VDD
+    wb = app.books.open(str(ruta))
+
     # El libro nuevo tiene 1 hoja vacía; se usa como ancla para el primer Copy
     wb_seg = app.books.add()
 
-    for _nombre_hoja in ["VDD1", "VDD2", "VDD3"]:
+    for _nombre_hoja in ["VDD1", "VDD3"]:
         _sh_origen = wb.sheets[_nombre_hoja]
         # Copy con After= última hoja de wb_seg → la copia queda al final
         _sh_origen.api.Copy(After=wb_seg.sheets[-1].api)
@@ -3549,8 +3893,23 @@ try:
     # Eliminar la hoja vacía inicial que Excel creó al abrir el libro nuevo
     wb_seg.sheets[0].api.Delete()
 
+    # Guardar primero con xlwings (VDD1/VDD3)
     wb_seg.save(str(_ruta_seg))
     wb_seg.close()
+
+    # ── Agregar hoja VDD2 (seguimiento diario) al SEGUIMIENTO_VDD_FIJA ──
+    try:
+        _wb_seg_opxl = _openpyxl.load_workbook(str(_ruta_seg))
+        _seg_agregar_hoja(_wb_seg_opxl, ruta, PERIODO, engine)
+        # Reordenar: VDD1, VDD2, VDD3
+        _sheetnames = _wb_seg_opxl.sheetnames
+        _idx_vdd2   = _sheetnames.index("VDD2")
+        _wb_seg_opxl.move_sheet("VDD2", offset=1 - _idx_vdd2)
+        _wb_seg_opxl.save(str(_ruta_seg))
+        print("[AVANCE] Hoja VDD2 agregada al libro SEGUIMIENTO_VDD_FIJA.")
+    except Exception as _e_seg:
+        print(f"[AVANCE] Aviso: no se pudo agregar hoja VDD2 al SEGUIMIENTO_VDD_FIJA: {_e_seg}")
+
     print(f"Seguimiento generado: {_ruta_seg}")
 
     # ── Generar libro AVANCE_VTAS_APPVENTORY con hojas MES y DIA ──
@@ -3570,7 +3929,22 @@ try:
     wb_vtas.close()
     print(f"Ventas AppVentory generado: {_ruta_vtas}")
 finally:
-    wb.close()
-    app.quit()
+    try:
+        wb.close()
+    except Exception:
+        pass
+    try:
+        app.quit()
+    except Exception:
+        pass
+    try:
+        _xl_com.Quit()
+    except Exception:
+        pass
+    try:
+        import pythoncom
+        pythoncom.CoUninitialize()
+    except Exception:
+        pass
 
 print(f"Listo: {ruta}")
