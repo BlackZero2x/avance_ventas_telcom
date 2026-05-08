@@ -1,48 +1,52 @@
 """
-Proceso CARLOS:
-1. Buscar AVANCE_{aaaa_mm_dd}.xlsx en Archivos_Avance (fecha de ayer)
-2. Enviar texto de saludo a Carlos (abre el chat si no existe)
-3. Enviar el archivo Excel como adjunto
+Proceso CARLOS — envío por correo electrónico:
+1. Buscar AVANCE_{aaaa-mm-dd}.xlsx en Archivos_Avance (fecha de ayer)
+2. Enviar el archivo por Gmail al destinatario definido en config["carlos_email"]
+   Asunto: Avance de FIJA actualizado al DD-MM-YYYY
 """
 import logging
 import os
-import time
 from datetime import datetime, timedelta
-from msg_utils import pick_variant
+
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "shared"))
+from gmail_helper import GmailHelper
 
 
 class CarlosProcess:
-    def __init__(self, config, wa):
+    def __init__(self, config, gmail_service):
         self.config = config
-        self.wa = wa
+        self.gmail = GmailHelper(gmail_service)
 
     def execute(self):
         logging.info("=" * 50)
-        logging.info("INICIANDO PROCESO CARLOS")
+        logging.info("INICIANDO PROCESO CARLOS (email)")
         logging.info("=" * 50)
 
         archivo = self._buscar_avance()
         if not archivo:
             return False
 
-        contacto = self.config["carlos_wa_contact"]
-        saludo = pick_variant(
-            self.config.get("carlos_message_variants"),
-            self.config["carlos_message"]
+        ayer = (datetime.now() - timedelta(days=1)).strftime("%d-%m-%Y")
+        asunto = f"Avance de FIJA actualizado al {ayer}"
+        cuerpo = (
+            f"Buen dia,\n\n"
+            f"Adjunto el reporte de avance de ventas FIJA actualizado al {ayer}.\n\n"
+            f"Saludos."
         )
 
-        # open-wa requiere sendText antes de send_file en chats nuevos
-        logging.info(f"Enviando saludo a Carlos: {saludo}")
-        r1 = self.wa.send_text(contacto, saludo)
-        logging.info(f"Resultado saludo: {r1}")
-        time.sleep(5)
+        destinatario = self.config.get("carlos_email", "")
+        logging.info(f"Enviando correo a: {destinatario}")
+        logging.info(f"Adjunto: {os.path.basename(archivo)}")
+        ok = self.gmail.send_email_with_attachment(
+            [destinatario], asunto, cuerpo, archivo
+        )
 
-        logging.info(f"Enviando archivo a Carlos: {os.path.basename(archivo)}")
-        r2 = self.wa.send_file(contacto, archivo, caption="")
-        logging.info(f"Resultado archivo: {r2}")
-
-        logging.info("PROCESO CARLOS COMPLETADO")
-        return True
+        if ok:
+            logging.info("PROCESO CARLOS COMPLETADO")
+        else:
+            logging.error("PROCESO CARLOS FALLO al enviar correo")
+        return ok
 
     def _buscar_avance(self):
         directorio = self.config["archivos_avance_dir"]

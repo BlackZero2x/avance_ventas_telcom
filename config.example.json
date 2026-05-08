@@ -2,14 +2,14 @@
   "email_sender": "trigger@tuempresa.com",
   "email_subject": "avance_ventas - Actualización disponible",
   "check_interval_minutes": 10,
-  "processed_emails_file": "C:/AVANCE_MOVISTAR/processed_emails.txt",
-  "temp_dir": "C:/AVANCE_MOVISTAR/temp",
-  "archivos_avance_dir": "C:/AVANCE_MOVISTAR/Archivos_Avance",
+  "processed_emails_file": "C:/proyectos/AVANCE_MOVISTAR/processed_emails.txt",
+  "temp_dir": "C:/proyectos/AVANCE_MOVISTAR/temp",
+  "archivos_avance_dir": "C:/proyectos/AVANCE_MOVISTAR/Archivos_Avance",
 
-  "google_credentials_path": "C:/AVANCE_MOVISTAR/credentials.json",
-  "google_token_path": "C:/AVANCE_MOVISTAR/token.json",
+  "google_credentials_path": "C:/proyectos/AVANCE_MOVISTAR/credentials.json",
+  "google_token_path": "C:/proyectos/AVANCE_MOVISTAR/token.json",
 
-  "avance_resumido_path": "C:/AVANCE_MOVISTAR/files/AVANCE_RESUMIDO.xlsx",
+  "avance_resumido_path": "C:/proyectos/AVANCE_MOVISTAR/files/AVANCE_RESUMIDO.xlsx",
 
   "wa_host": "localhost",
   "wa_port": 8002,
@@ -25,7 +25,7 @@
 
   "jefes_wa_group": "Nombre del grupo de jefes en WhatsApp",
   "jefes_tds_rango1": "B4:V15",
-  "jefes_tds_rango2": "Y4:AT16",
+  "jefes_tds_rango2": "Y4:AT17",
   "jefes_mensaje_captura1_variants": [
     "@NUMERO1 @NUMERO2 Buen día, remito avances actualizados.",
     "@NUMERO1 @NUMERO2 Buenos días, adjunto el archivo actualizado."
@@ -59,21 +59,8 @@
     "Adjunto el reporte de ventas D-1."
   ],
 
-  "guillermo_wa_contact": "Nombre Contacto 3",
-  "guillermo_message": "Buen día, adjunto el avance de ventas actualizado.",
-  "guillermo_message_variants": [
-    "Buen día, adjunto el avance de ventas actualizado.",
-    "Te mando el reporte al D-1.",
-    "Remito el avance de ventas actualizado."
-  ],
-
-  "carlos_wa_contact": "Nombre Contacto 4",
-  "carlos_message": "Hola, adjunto el avance de ventas actualizado.",
-  "carlos_message_variants": [
-    "Buen día, adjunto el avance de ventas actualizado hasta ayer.",
-    "Te mando el reporte al D-1.",
-    "Remito el avance de ventas actualizado."
-  ],
+  "carlos_email": "recipient@yourcompany.com",
+  "guillermo_email": "recipient2@yourcompany.com",
 
   "italo_wa_contact": "Nombre Contacto 5",
   "italo_google_sheet_id": "ID_DE_TU_GOOGLE_SHEET",
