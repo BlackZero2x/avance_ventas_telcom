@@ -36,7 +36,7 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 
-CONFIG_PATH = "C:/AVANCE_MOVISTAR/config.json"
+CONFIG_PATH = "C:/proyectos/AVANCE_MOVISTAR/config.json"
 
 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
     config = json.load(f)
@@ -48,7 +48,7 @@ wa = WhatsAppClient(
 )
 
 # El numero propio viene del config de open-wa (whatsapp_server/config.json)
-WA_CONFIG_PATH = "C:/AVANCE_MOVISTAR/whatsapp_server/config.json"
+WA_CONFIG_PATH = "C:/proyectos/AVANCE_MOVISTAR/whatsapp_server/config.json"
 with open(WA_CONFIG_PATH, "r", encoding="utf-8") as f:
     wa_config = json.load(f)
 MY_NUMBER = wa_config.get("my_number", "")
@@ -411,9 +411,16 @@ def test_orquestador():
     """Ejecuta todos los procesos en orden, sin esperar trigger de email."""
     logging.info("--- ORQUESTADOR MANUAL (sin trigger) ---")
     import os
-    os.environ["HTTPS_PROXY"] = "http://192.168.2.1:3128"
-    os.environ["HTTP_PROXY"]  = "http://192.168.2.1:3128"
-    os.environ["NO_PROXY"]    = "localhost,127.0.0.1"
+    _proxy = os.environ.get("PROXY_URL", "http://192.168.2.1:3128")
+    try:
+        import urllib.request
+        urllib.request.urlopen(_proxy, timeout=3)
+        os.environ["HTTPS_PROXY"] = _proxy
+        os.environ["HTTP_PROXY"]  = _proxy
+        os.environ["NO_PROXY"]    = "localhost,127.0.0.1,googleapis.com,google.com"
+    except Exception:
+        for _v in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
+            os.environ.pop(_v, None)
 
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build

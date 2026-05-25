@@ -1,0 +1,957 @@
+"""
+cortes_ventas.py — Informe de cortes horarios de ventas declaradas por supervisores.
+
+Lee el Google Sheet de respuestas del formulario, calcula tablas por ZONAL y SUPERVISOR,
+genera imágenes Excel formateadas y las envía a los grupos de WhatsApp correspondientes.
+
+Uso — informe (se ejecuta en cada horario de corte):
+    python cortes_ventas.py --corte 12PM
+    python cortes_ventas.py --corte 2PM
+    python cortes_ventas.py --corte 4PM
+    python cortes_ventas.py --corte 6PM
+    python cortes_ventas.py --corte CIERRE
+
+Uso — alerta previa (se ejecuta 10 min antes de cada corte):
+    python cortes_ventas.py --corte 12PM --alerta
+    python cortes_ventas.py --corte CIERRE --alerta
+"""
+import argparse
+import logging
+import os
+import sys
+import time
+import tempfile
+from datetime import date, datetime
+from pathlib import Path
+from urllib.parse import quote
+
+
+# ── Configurar proxy y entorno ────────────────────────────────────────────────
+
+def _cargar_dotenv():
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+def _configurar_proxy():
+    no_proxy = "localhost,127.0.0.1,.googleapis.com,.google.com,.gstatic.com"
+    os.environ["NO_PROXY"] = no_proxy
+    os.environ["no_proxy"] = no_proxy
+
+    proxy_host = os.environ.get("HTTP_PROXY", "")
+    user = os.environ.get("PROXY_USER", "")
+    password = os.environ.get("PROXY_PASS", "")
+
+    if proxy_host and user and password:
+        encoded_user = quote(user, safe="")
+        encoded_pass = quote(password, safe="")
+        base = proxy_host.replace("http://", "").replace("https://", "")
+        proxy_url = f"http://{encoded_user}:{encoded_pass}@{base}"
+    elif proxy_host:
+        proxy_url = proxy_host
+    else:
+        proxy_url = ""
+
+    if proxy_url:
+        os.environ["HTTP_PROXY"] = proxy_url
+        os.environ["http_proxy"] = proxy_url
+    else:
+        for var in ("HTTP_PROXY", "http_proxy"):
+            os.environ.pop(var, None)
+    for var in ("HTTPS_PROXY", "https_proxy"):
+        os.environ.pop(var, None)
+
+
+_cargar_dotenv()
+_configurar_proxy()
+
+import pandas as pd
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+
+sys.path.insert(0, str(Path(__file__).parent / "whatsapp_server"))
+sys.path.insert(0, str(Path(__file__).parent / "modules"))
+
+from wa_client import WhatsAppClient
+
+
+# ── Constantes ────────────────────────────────────────────────────────────────
+
+CORTES_VALIDOS = ["12PM", "2PM", "4PM", "6PM", "CIERRE"]
+PESOS_CORTE = {"12PM": 0.25, "2PM": 0.50, "4PM": 0.75, "6PM": 1.0, "CIERRE": None}
+
+# Orden de columnas de horas en las tablas
+HORAS = ["12PM", "2PM", "4PM", "6PM", "CIERRE"]
+
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
+
+BASE_DIR = Path(__file__).parent
+CONFIG_PATH = BASE_DIR / "config.json"
+TOKEN_PATH = BASE_DIR / "token.json"
+CREDS_PATH = BASE_DIR / "credentials.json"
+LOGS_DIR = BASE_DIR / "logs"
+TEMP_DIR = BASE_DIR / "temp"
+
+# ID del Google Sheet de cortes (hoja Respuestas + hoja CUOTAS)
+SHEET_ID = os.environ.get("CORTES_SHEET_ID", "1yrzxBxuwUsB0qNyjnpc5AbkQlojPkU4dS4zm1XftSt8")
+
+# Nombres de grupos en config.json
+GRUPO_VPA = "⚡⚡VPA - Auren"
+GRUPO_SUPERVISORES = "Canal Fija 2026 Supervisores y Jefes"
+GRUPO_GESTION = "Canal Fija 2026 Gestión AUREN"
+
+# Colores para el Excel de imagen (RGB como tuplas)
+COLOR_HEADER = (31, 73, 125)       # azul oscuro
+COLOR_HEADER_FONT = (255, 255, 255)
+COLOR_FILA_PAR = (217, 226, 243)   # azul muy claro
+COLOR_TOTAL = (198, 224, 180)      # verde claro
+COLOR_VERDE = (0, 176, 80)
+COLOR_AMARILLO = (255, 192, 0)
+COLOR_ROJO = (255, 0, 0)
+COLOR_NEGRO = (0, 0, 0)
+COLOR_BLANCO = (255, 255, 255)
+
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+LOGS_DIR.mkdir(exist_ok=True)
+TEMP_DIR.mkdir(exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(
+            LOGS_DIR / f"cortes_{datetime.now().strftime('%Y%m%d')}.log",
+            encoding="utf-8"
+        ),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+
+
+# ── Autenticación Google ──────────────────────────────────────────────────────
+
+def _autenticar_sheets():
+    creds = None
+    if TOKEN_PATH.exists():
+        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(str(CREDS_PATH), SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open(TOKEN_PATH, "w") as f:
+            f.write(creds.to_json())
+    return build("sheets", "v4", credentials=creds)
+
+
+# ── Lectura del Google Sheet ──────────────────────────────────────────────────
+
+def _leer_hoja(service, nombre_hoja):
+    resultado = service.spreadsheets().values().get(
+        spreadsheetId=SHEET_ID,
+        range=nombre_hoja,
+    ).execute()
+    valores = resultado.get("values", [])
+    if not valores or len(valores) < 2:
+        return pd.DataFrame()
+    encabezados = valores[0]
+    filas = valores[1:]
+    # Normalizar filas con distinta longitud
+    filas_norm = [fila + [""] * (len(encabezados) - len(fila)) for fila in filas]
+    return pd.DataFrame(filas_norm, columns=encabezados)
+
+
+def cargar_datos(service, corte: str, fecha_hoy: date) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Retorna (df_respuestas_filtrado, df_cuotas).
+    df_respuestas contiene solo registros del día y corte dado.
+    """
+    logging.info(f"Leyendo hoja Respuestas del Sheet...")
+    df_resp = _leer_hoja(service, "Respuestas")
+    logging.info(f"Leyendo hoja CUOTAS del Sheet...")
+    df_cuotas = _leer_hoja(service, "CUOTAS")
+
+    if df_resp.empty:
+        logging.warning("La hoja Respuestas esta vacia o no tiene datos.")
+        return df_resp, df_cuotas
+
+    # Normalizar tipos
+    df_resp["VENTA_REGULAR"] = pd.to_numeric(df_resp.get("VENTA_REGULAR", 0), errors="coerce").fillna(0).astype(int)
+    df_resp["VENTA_FLEX"] = pd.to_numeric(df_resp.get("VENTA_FLEX", 0), errors="coerce").fillna(0).astype(int)
+    df_resp["VENTA_TOTAL"] = df_resp["VENTA_REGULAR"] + df_resp["VENTA_FLEX"]
+
+    # Normalizar CORTE (puede venir con espacios o diferente capitalización)
+    df_resp["CORTE"] = df_resp["CORTE"].str.strip().str.upper()
+
+    # Parsear FECHA_CORTE
+    df_resp["FECHA_CORTE_DT"] = pd.to_datetime(
+        df_resp["FECHA_CORTE"], dayfirst=True, errors="coerce"
+    ).dt.date
+
+    # Filtrar por fecha y corte
+    mask = (df_resp["FECHA_CORTE_DT"] == fecha_hoy) & (df_resp["CORTE"] == corte.upper())
+    df_filtrado = df_resp[mask].copy()
+    logging.info(f"Registros encontrados para {corte} / {fecha_hoy}: {len(df_filtrado)}")
+
+    return df_filtrado, df_cuotas
+
+
+# ── Cálculo de tablas ─────────────────────────────────────────────────────────
+
+def _cuotas_por_zonal(df_cuotas: pd.DataFrame) -> dict:
+    """Devuelve {zonal: cuota_dia} desde la hoja CUOTAS."""
+    cuotas = {}
+    if df_cuotas.empty:
+        return cuotas
+    # Columnas esperadas: ZONAL, SUPERVISOR, CUOTA_DIA
+    df_cuotas["CUOTA_DIA"] = pd.to_numeric(df_cuotas.get("CUOTA_DIA", 0), errors="coerce").fillna(0)
+    for _, fila in df_cuotas.iterrows():
+        zonal = str(fila.get("ZONAL", "")).strip()
+        if zonal:
+            cuotas[zonal] = cuotas.get(zonal, 0) + fila["CUOTA_DIA"]
+    return cuotas
+
+
+def _cuotas_por_supervisor(df_cuotas: pd.DataFrame) -> dict:
+    """Devuelve {sup: cuota_dia} desde la hoja CUOTAS (cuotas directas por supervisor)."""
+    cuotas = {}
+    if df_cuotas.empty:
+        return cuotas
+    df_cuotas["CUOTA_DIA"] = pd.to_numeric(df_cuotas.get("CUOTA_DIA", 0), errors="coerce").fillna(0)
+    for _, fila in df_cuotas.iterrows():
+        sup = str(fila.get("SUPERVISOR", "")).strip()
+        if sup:
+            cuotas[sup] = fila["CUOTA_DIA"]
+    return cuotas
+
+
+def calcular_tabla_zonal(
+    df_todos: pd.DataFrame,
+    df_cuotas: pd.DataFrame,
+    corte_actual: str,
+    fecha_hoy: date,
+) -> pd.DataFrame:
+    """
+    Construye la tabla resumen por ZONAL con columnas:
+    ZONAL, 12PM, 2PM, 4PM, 6PM, CIERRE, CUOTA, %ALCANCE, PROYECTADO
+    """
+    cuotas_zonal = _cuotas_por_zonal(df_cuotas)
+
+    # Necesitamos todos los cortes del día (no solo el actual) para construir las columnas
+    df_dia = df_todos.copy() if not df_todos.empty else pd.DataFrame(
+        columns=["ZONAL", "CORTE", "VENTA_TOTAL", "FECHA_CORTE_DT", "VENTA_REGULAR", "VENTA_FLEX"]
+    )
+
+    # Pivot: zonal x corte → suma de ventas
+    if not df_dia.empty:
+        pivot = df_dia.groupby(["ZONAL", "CORTE"])["VENTA_TOTAL"].sum().unstack(fill_value=0)
+    else:
+        pivot = pd.DataFrame()
+
+    # Recoger todas las zonales (del Sheet y de CUOTAS)
+    zonales = sorted(set(list(pivot.index if not pivot.empty else [])) | set(cuotas_zonal.keys()))
+
+    filas = []
+    for zonal in zonales:
+        fila = {"ZONAL": zonal}
+        for h in HORAS:
+            fila[h] = int(pivot.loc[zonal, h]) if (not pivot.empty and zonal in pivot.index and h in pivot.columns) else 0
+
+        suma_cortes = sum(fila[h] for h in HORAS)
+        fila["AVANCE_DIA"] = suma_cortes
+
+        cuota = cuotas_zonal.get(zonal, 0)
+        fila["CUOTA"] = int(cuota)
+        fila["%ALCANCE"] = (suma_cortes / cuota * 100) if cuota > 0 else 0.0
+
+        peso = PESOS_CORTE.get(corte_actual)
+        if peso and peso > 0:
+            suma_hasta_corte = sum(fila[h] for h in HORAS if h != "CIERRE")
+            fila["PROYECTADO"] = int(round(suma_hasta_corte / peso))
+        else:
+            fila["PROYECTADO"] = int(suma_cortes)
+
+        filas.append(fila)
+
+    df_tabla = pd.DataFrame(filas, columns=["ZONAL"] + HORAS + ["AVANCE_DIA", "CUOTA", "%ALCANCE", "PROYECTADO"])
+
+    # Fila de totales
+    totales = {"ZONAL": "TOTAL"}
+    for h in HORAS:
+        totales[h] = int(df_tabla[h].sum())
+    totales["AVANCE_DIA"] = int(df_tabla["AVANCE_DIA"].sum())
+    totales["CUOTA"] = int(df_tabla["CUOTA"].sum())
+    totales["%ALCANCE"] = (
+        totales["AVANCE_DIA"] / totales["CUOTA"] * 100
+        if totales["CUOTA"] > 0 else 0.0
+    )
+    peso = PESOS_CORTE.get(corte_actual)
+    if peso and peso > 0:
+        totales["PROYECTADO"] = int(round(
+            sum(totales[h] for h in HORAS if h != "CIERRE") / peso
+        ))
+    else:
+        totales["PROYECTADO"] = int(totales["AVANCE_DIA"])
+
+    df_tabla = pd.concat([df_tabla, pd.DataFrame([totales])], ignore_index=True)
+    return df_tabla
+
+
+def calcular_tabla_supervisor(
+    df_todos: pd.DataFrame,
+    df_cuotas: pd.DataFrame,
+    corte_actual: str,
+    fecha_hoy: date,
+) -> pd.DataFrame:
+    """
+    Construye la tabla resumen por SUPERVISOR con columnas:
+    ZONAL, SUP, 12PM, 2PM, 4PM, 6PM, CIERRE, CUOTA, %ALCANCE, PROYECTADO
+    """
+    cuotas_sup = _cuotas_por_supervisor(df_cuotas)
+
+    df_dia = df_todos.copy() if not df_todos.empty else pd.DataFrame(
+        columns=["ZONAL", "SUP", "CORTE", "VENTA_TOTAL", "FECHA_CORTE_DT"]
+    )
+
+    if not df_dia.empty:
+        pivot = df_dia.groupby(["ZONAL", "SUP", "CORTE"])["VENTA_TOTAL"].sum().unstack(fill_value=0)
+    else:
+        pivot = pd.DataFrame()
+
+    # Recoger todos los supervisores (del Sheet y de CUOTAS)
+    sups_sheet = set()
+    if not pivot.empty:
+        for zonal, sup in pivot.index:
+            sups_sheet.add((zonal, sup))
+
+    sups_cuotas = set()
+    if not df_cuotas.empty:
+        for _, fila in df_cuotas.iterrows():
+            z = str(fila.get("ZONAL", "")).strip()
+            s = str(fila.get("SUPERVISOR", "")).strip()
+            if z and s:
+                sups_cuotas.add((z, s))
+
+    todos_sups = sorted(sups_sheet | sups_cuotas)
+
+    filas = []
+    for zonal, sup in todos_sups:
+        fila = {"ZONAL": zonal, "SUP": sup}
+        for h in HORAS:
+            fila[h] = (
+                int(pivot.loc[(zonal, sup), h])
+                if (not pivot.empty and (zonal, sup) in pivot.index and h in pivot.columns)
+                else 0
+            )
+
+        suma_cortes = sum(fila[h] for h in HORAS)
+        fila["AVANCE_DIA"] = suma_cortes
+
+        cuota = cuotas_sup.get(sup, 0)
+        fila["CUOTA"] = int(cuota)
+        fila["%ALCANCE"] = (suma_cortes / cuota * 100) if cuota > 0 else 0.0
+
+        peso = PESOS_CORTE.get(corte_actual)
+        if peso and peso > 0:
+            suma_hasta_corte = sum(fila[h] for h in HORAS if h != "CIERRE")
+            fila["PROYECTADO"] = int(round(suma_hasta_corte / peso))
+        else:
+            fila["PROYECTADO"] = int(suma_cortes)
+
+        filas.append(fila)
+
+    cols = ["ZONAL", "SUP"] + HORAS + ["AVANCE_DIA", "CUOTA", "%ALCANCE", "PROYECTADO"]
+    df_tabla = pd.DataFrame(filas, columns=cols)
+
+    # Fila de totales
+    totales = {"ZONAL": "TOTAL", "SUP": ""}
+    for h in HORAS:
+        totales[h] = int(df_tabla[h].sum())
+    totales["AVANCE_DIA"] = int(df_tabla["AVANCE_DIA"].sum())
+    totales["CUOTA"] = int(df_tabla["CUOTA"].sum())
+    totales["%ALCANCE"] = (
+        totales["AVANCE_DIA"] / totales["CUOTA"] * 100
+        if totales["CUOTA"] > 0 else 0.0
+    )
+    peso = PESOS_CORTE.get(corte_actual)
+    if peso and peso > 0:
+        totales["PROYECTADO"] = int(round(
+            sum(totales[h] for h in HORAS if h != "CIERRE") / peso
+        ))
+    else:
+        totales["PROYECTADO"] = int(totales["AVANCE_DIA"])
+
+    df_tabla = pd.concat([df_tabla, pd.DataFrame([totales])], ignore_index=True)
+    return df_tabla
+
+
+# ── Generación de imagen Excel ────────────────────────────────────────────────
+
+def _rgb(r, g, b):
+    """Convierte RGB a valor entero para openpyxl."""
+    from openpyxl.styles import PatternFill
+    return PatternFill(start_color=f"{r:02X}{g:02X}{b:02X}", end_color=f"{r:02X}{g:02X}{b:02X}", fill_type="solid")
+
+
+def _color_alcance(valor_pct: float):
+    """Retorna RGB según semáforo de %ALCANCE."""
+    if valor_pct >= 90:
+        return COLOR_VERDE
+    elif valor_pct >= 70:
+        return COLOR_AMARILLO
+    else:
+        return COLOR_ROJO
+
+
+def generar_imagen_tabla(df: pd.DataFrame, titulo: str, ruta_png: str) -> str | None:
+    """
+    Genera un archivo Excel formateado y devuelve la ruta del xlsx temporal.
+    La captura PNG se realiza en generar_imagenes_tablas() con una sola instancia de Excel.
+    """
+    import openpyxl
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    from openpyxl.utils import get_column_letter
+    import xlwings as xw
+    import subprocess
+
+    ruta_xlsx = ruta_png.replace(".png", ".xlsx")
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Tabla"
+
+    # ── Título ────────────────────────────────────────────────────────────────
+    ws.merge_cells(f"A1:{get_column_letter(len(df.columns))}1")
+    celda_titulo = ws["A1"]
+    celda_titulo.value = titulo
+    celda_titulo.font = Font(name="Aptos Narrow", bold=True, size=13, color="FFFFFF")
+    celda_titulo.fill = _rgb(*COLOR_HEADER)
+    celda_titulo.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 22
+
+    # ── Encabezados ───────────────────────────────────────────────────────────
+    borde_fino = Border(
+        left=Side(style="thin"),
+        right=Side(style="thin"),
+        top=Side(style="thin"),
+        bottom=Side(style="thin"),
+    )
+    for col_idx, col_nombre in enumerate(df.columns, start=1):
+        celda = ws.cell(row=2, column=col_idx, value=col_nombre)
+        celda.font = Font(name="Aptos Narrow", bold=True, size=10, color="FFFFFF")
+        celda.fill = _rgb(*COLOR_HEADER)
+        celda.alignment = Alignment(horizontal="center", vertical="center")
+        celda.border = borde_fino
+    ws.row_dimensions[2].height = 18
+
+    # ── Filas de datos ────────────────────────────────────────────────────────
+    col_alcance_idx = list(df.columns).index("%ALCANCE") + 1 if "%ALCANCE" in df.columns else None
+    es_fila_total = len(df) - 1  # última fila = totales
+
+    for fila_idx, (_, row) in enumerate(df.iterrows(), start=3):
+        es_total = (fila_idx - 3) == es_fila_total
+        fill_fila = _rgb(*COLOR_TOTAL) if es_total else (
+            _rgb(*COLOR_FILA_PAR) if (fila_idx % 2 == 0) else None
+        )
+        for col_idx, col_nombre in enumerate(df.columns, start=1):
+            valor = row[col_nombre]
+            celda = ws.cell(row=fila_idx, column=col_idx)
+
+            # Formatear %ALCANCE
+            if col_nombre == "%ALCANCE":
+                celda.value = valor / 100 if isinstance(valor, (int, float)) else 0
+                celda.number_format = "0.0%"
+                r, g, b = _color_alcance(float(valor))
+                celda.fill = _rgb(r, g, b)
+                celda.font = Font(name="Aptos Narrow", bold=es_total, size=9, color="FFFFFF")
+            else:
+                celda.value = int(valor) if isinstance(valor, float) and valor == int(valor) else valor
+                celda.font = Font(name="Aptos Narrow", bold=es_total, size=9)
+                if fill_fila and col_nombre != "%ALCANCE":
+                    celda.fill = fill_fila
+
+            celda.alignment = Alignment(
+                horizontal="center" if col_nombre not in ("ZONAL", "SUP") else "left",
+                vertical="center"
+            )
+            celda.border = borde_fino
+        ws.row_dimensions[fila_idx].height = 15
+
+    # ── Anchos de columna ─────────────────────────────────────────────────────
+    anchos_fijos = {
+        "12PM": 7, "2PM": 7, "4PM": 7, "6PM": 7, "CIERRE": 8,
+        "AVANCE_DIA": 11, "CUOTA": 8, "%ALCANCE": 10, "PROYECTADO": 11,
+    }
+    for col_idx, col_nombre in enumerate(df.columns, start=1):
+        col_letter = get_column_letter(col_idx)
+        if col_nombre in ("ZONAL", "SUP"):
+            # Autoajuste: medir el texto más largo de esa columna (datos + encabezado)
+            max_len = max(
+                (len(str(v)) for v in df[col_nombre] if v is not None),
+                default=len(col_nombre)
+            )
+            max_len = max(max_len, len(col_nombre))
+            ws.column_dimensions[col_letter].width = min(max_len + 2, 40)
+        else:
+            ws.column_dimensions[col_letter].width = anchos_fijos.get(col_nombre, 10)
+
+    wb.save(ruta_xlsx)
+    logging.info(f"Excel temporal guardado: {ruta_xlsx}")
+    # La captura real se hace en generar_imagenes_tablas() con una sola instancia de Excel
+    return ruta_xlsx
+
+
+def _capturar_xlsx_a_png(ws_xw, n_filas: int, n_cols: int, ruta_png: str) -> bool:
+    """Captura el rango de datos de una hoja xlwings como PNG via CopyPicture."""
+    from openpyxl.utils import get_column_letter
+    from PIL import ImageGrab
+    import win32gui
+    import ctypes
+
+    ultima_col = get_column_letter(n_cols)
+    rango = f"A1:{ultima_col}{n_filas}"
+    xl_range = ws_xw.range(rango)
+
+    # Traer Excel al frente para que CopyPicture funcione
+    try:
+        app = ws_xw.book.app
+        app.api.Visible = True
+        hwnd = [0]
+        def _cb(h, _):
+            if win32gui.IsWindowVisible(h) and "Microsoft Excel" in win32gui.GetWindowText(h):
+                hwnd[0] = h
+                return False
+            return True
+        win32gui.EnumWindows(_cb, None)
+        if hwnd[0]:
+            ctypes.windll.user32.AllowSetForegroundWindow(ctypes.windll.kernel32.GetCurrentProcessId())
+            win32gui.ShowWindow(hwnd[0], 9)
+            win32gui.SetForegroundWindow(hwnd[0])
+        time.sleep(1)
+    except Exception:
+        pass
+
+    # CopyPicture con hasta 3 reintentos
+    for intento in range(3):
+        try:
+            xl_range.api.CopyPicture(Appearance=1, Format=2)
+            time.sleep(1.5)
+            img = ImageGrab.grabclipboard()
+            if img:
+                img.save(ruta_png, "PNG")
+                logging.info(f"Imagen guardada: {ruta_png}")
+                return True
+        except Exception as e:
+            logging.warning(f"CopyPicture intento {intento+1} fallido: {e}")
+            time.sleep(1 + intento)
+
+    logging.error(f"No se pudo capturar imagen para {ruta_png}")
+    return False
+
+
+def generar_imagenes_tablas(trabajos: list[tuple]) -> dict:
+    """
+    Genera múltiples imágenes PNG en una sola instancia de Excel.
+
+    trabajos: lista de (df, titulo, ruta_png)
+    Retorna {ruta_png: True/False}
+    """
+    import xlwings as xw
+    import subprocess
+
+    resultados = {ruta_png: False for _, _, ruta_png in trabajos}
+    xlsx_temps = []
+
+    # Paso 1: generar todos los xlsx con openpyxl (sin Excel)
+    for df, titulo, ruta_png in trabajos:
+        ruta_xlsx = generar_imagen_tabla(df, titulo, ruta_png)
+        xlsx_temps.append((ruta_xlsx, ruta_png, len(df) + 2, len(df.columns)))
+
+    # Paso 2: abrir Excel una sola vez y capturar todos
+    app = None
+    try:
+        subprocess.run(["taskkill", "/f", "/im", "EXCEL.EXE"], capture_output=True)
+        time.sleep(1)
+        app = xw.App(visible=True, add_book=False)
+        app.display_alerts = False
+
+        for ruta_xlsx, ruta_png, n_filas, n_cols in xlsx_temps:
+            if not ruta_xlsx or not os.path.exists(ruta_xlsx):
+                continue
+            wb_xw = None
+            try:
+                wb_xw = app.books.open(os.path.normpath(ruta_xlsx))
+                ws_xw = wb_xw.sheets["Tabla"]
+                ws_xw.activate()
+                time.sleep(0.5)
+                resultados[ruta_png] = _capturar_xlsx_a_png(ws_xw, n_filas, n_cols, ruta_png)
+            except Exception as e:
+                logging.error(f"Error capturando {ruta_png}: {e}")
+            finally:
+                if wb_xw:
+                    try:
+                        wb_xw.close()
+                    except Exception:
+                        pass
+                try:
+                    os.remove(ruta_xlsx)
+                except Exception:
+                    pass
+                time.sleep(0.5)
+    except Exception as e:
+        logging.error(f"Error iniciando Excel para capturas: {e}")
+    finally:
+        if app:
+            try:
+                app.quit()
+            except Exception:
+                pass
+
+    return resultados
+
+
+# ── Texto resumen ─────────────────────────────────────────────────────────────
+
+def _emoji_alcance(pct: float) -> str:
+    if pct >= 90:
+        return "✅"
+    elif pct >= 70:
+        return "⚠️"
+    return "🔴"
+
+
+def _avance_dia_total(df_zonal: pd.DataFrame) -> int:
+    """Retorna el AVANCE_DIA de la fila TOTAL."""
+    if "TOTAL" in df_zonal["ZONAL"].values:
+        return int(df_zonal[df_zonal["ZONAL"] == "TOTAL"].iloc[0]["AVANCE_DIA"])
+    return int(df_zonal["AVANCE_DIA"].sum())
+
+
+def construir_caption_vpa(df_zonal: pd.DataFrame, corte: str, fecha: date) -> str:
+    """Mensaje formal para el grupo VPA (cliente Movistar). Va como caption de la imagen."""
+    fecha_str = fecha.strftime("%d/%m/%Y")
+    saludo = "Buenos días" if corte == "CIERRE" else "Buenas tardes"
+    avance = _avance_dia_total(df_zonal)
+
+    if corte == "CIERRE":
+        return (
+            f"{saludo},\n"
+            f"Remitimos el cierre de ventas del día *{fecha_str}*.\n"
+            f"Acumulado: *{avance}* ventas."
+        )
+    return (
+        f"{saludo},\n"
+        f"Remitimos el avance de ventas al corte de las *{corte}* del día *{fecha_str}*.\n"
+        f"Acumulado: *{avance}* ventas."
+    )
+
+
+def construir_texto_resumen(df_zonal: pd.DataFrame, corte: str, fecha: date) -> str:
+    """Mensaje interno para el grupo de supervisores."""
+    fecha_str = fecha.strftime("%d/%m/%Y")
+    fila_total = df_zonal[df_zonal["ZONAL"] == "TOTAL"].iloc[0] if "TOTAL" in df_zonal["ZONAL"].values else None
+    cuota_total = int(fila_total["CUOTA"]) if fila_total is not None else 0
+    alcance = float(fila_total["%ALCANCE"]) if fila_total is not None else 0.0
+    proyectado = int(fila_total["PROYECTADO"]) if fila_total is not None else 0
+    avance = _avance_dia_total(df_zonal)
+    emoji = _emoji_alcance(alcance)
+
+    lineas = [
+        f"📊 *CORTE {corte} — {fecha_str}*",
+        "━━━━━━━━━━━━━━━━━━━━━",
+        f"{emoji} *Avance día:* {avance}",
+        f"🎯 *Cuota:* {cuota_total} | *%Alcance:* {alcance:.1f}%",
+        f"📈 *Proyectado:* {proyectado}",
+        "━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    return "\n".join(lineas)
+
+
+# ── Envíos WhatsApp ───────────────────────────────────────────────────────────
+
+def enviar_informe(wa: WhatsAppClient, df_zonal: pd.DataFrame, df_sup: pd.DataFrame, corte: str, fecha: date):
+    fecha_str = fecha.strftime("%d/%m/%Y")
+    caption_vpa = construir_caption_vpa(df_zonal, corte, fecha)
+    texto_sup   = construir_texto_resumen(df_zonal, corte, fecha)
+
+    png_zonal = str(TEMP_DIR / f"corte_{corte}_zonal.png")
+    png_sup   = str(TEMP_DIR / f"corte_{corte}_sup.png")
+
+    titulo_zonal = f"VENTAS POR ZONAL — CORTE {corte} | {fecha_str}"
+    titulo_sup   = f"VENTAS POR SUPERVISOR — CORTE {corte} | {fecha_str}"
+
+    # Generar ambas imágenes en una sola instancia de Excel
+    resultados = generar_imagenes_tablas([
+        (df_zonal, titulo_zonal, png_zonal),
+        (df_sup,   titulo_sup,   png_sup),
+    ])
+    ok_zonal = resultados.get(png_zonal, False)
+    ok_sup   = resultados.get(png_sup,   False)
+
+    # ── Grupo VPA: imagen zonal con caption formal (un solo mensaje) ──────────
+    logging.info(f"Enviando tabla ZONAL a: {GRUPO_VPA}")
+    if ok_zonal:
+        wa.send_image(GRUPO_VPA, png_zonal, caption=caption_vpa)
+    else:
+        wa.send_text(GRUPO_VPA, caption_vpa)
+        logging.warning("No se pudo generar imagen zonal — enviando solo texto.")
+    time.sleep(8)
+
+    # ── Grupo Supervisores: texto resumen + imagen zonal + imagen supervisores ─
+    logging.info(f"Enviando tabla ZONAL + SUPERVISORES a: {GRUPO_SUPERVISORES}")
+    wa.send_text(GRUPO_SUPERVISORES, texto_sup)
+    time.sleep(5)
+    if ok_zonal:
+        wa.send_image(GRUPO_SUPERVISORES, png_zonal, caption="")
+    else:
+        logging.warning("No se pudo generar imagen zonal — enviando solo texto.")
+    time.sleep(8)
+    if ok_sup:
+        wa.send_image(GRUPO_SUPERVISORES, png_sup, caption="")
+    else:
+        logging.warning("No se pudo generar imagen supervisores — enviando solo texto.")
+    time.sleep(8)
+
+    # Limpiar temporales
+    for f in [png_zonal, png_sup]:
+        try:
+            if os.path.exists(f):
+                os.remove(f)
+        except Exception:
+            pass
+
+
+# ── Alerta de supervisores pendientes ────────────────────────────────────────
+
+def _telefonos_supervisores(df_cuotas: pd.DataFrame) -> dict:
+    """
+    Devuelve {nombre_sup: "51XXXXXXXXX@c.us"} leyendo la columna TELEFONO de CUOTAS.
+    Acepta números con o sin prefijo 51, con o sin guiones/espacios.
+    """
+    resultado = {}
+    if df_cuotas.empty or "TELEFONO" not in df_cuotas.columns:
+        return resultado
+    for _, fila in df_cuotas.iterrows():
+        sup = str(fila.get("SUPERVISOR", "")).strip()
+        tel = str(fila.get("TELEFONO", "")).strip()
+        if not sup or not tel:
+            continue
+        # Limpiar: quitar guiones, espacios, paréntesis
+        tel = tel.replace("-", "").replace(" ", "").replace("(", "").replace(")", "")
+        # Asegurar prefijo 51
+        if tel.startswith("51") and len(tel) == 11:
+            wa_id = f"{tel}@c.us"
+        elif len(tel) == 9:
+            wa_id = f"51{tel}@c.us"
+        else:
+            logging.warning(f"Telefono invalido para {sup}: {tel} — se omitira de menciones")
+            continue
+        resultado[sup] = wa_id
+    return resultado
+
+
+def _supervisores_que_reportaron(df_todos_dia: pd.DataFrame, corte: str) -> set:
+    """Devuelve el conjunto de nombres de supervisores que ya enviaron el corte dado."""
+    if df_todos_dia.empty:
+        return set()
+    mask = df_todos_dia["CORTE"] == corte.upper()
+    return set(df_todos_dia.loc[mask, "SUP"].str.strip().unique())
+
+
+def alertar_pendientes(
+    wa: WhatsAppClient,
+    service,
+    corte: str,
+    fecha: date,
+):
+    """
+    Lee el Sheet, detecta supervisores que NO enviaron el corte indicado
+    y envía un mensaje con menciones al grupo de supervisores.
+    """
+    logging.info(f"Verificando pendientes para alerta previa — corte {corte}")
+
+    df_cuotas = _leer_hoja(service, "CUOTAS")
+    df_todos_dia = cargar_todos_del_dia(service, fecha)
+
+    # Todos los supervisores conocidos (de CUOTAS)
+    todos_sups = {}
+    if not df_cuotas.empty:
+        for _, fila in df_cuotas.iterrows():
+            sup = str(fila.get("SUPERVISOR", "")).strip()
+            if sup:
+                todos_sups[sup] = sup
+
+    telefonos = _telefonos_supervisores(df_cuotas)
+    ya_reportaron = _supervisores_que_reportaron(df_todos_dia, corte)
+
+    pendientes = [s for s in todos_sups if s not in ya_reportaron]
+
+    logging.info(f"Supervisores totales: {len(todos_sups)} | Ya reportaron: {len(ya_reportaron)} | Pendientes: {len(pendientes)}")
+
+    if not pendientes:
+        logging.info("Todos los supervisores ya reportaron. No se envia alerta.")
+        return
+
+    # Construir mensaje con menciones
+    fecha_str = fecha.strftime("%d/%m/%Y")
+    lineas_pendientes = []
+    ids_menciones = []
+    for sup in sorted(pendientes):
+        wa_id = telefonos.get(sup)
+        if wa_id:
+            # WhatsApp renderiza @número en el mensaje, el nombre se muestra por la mención
+            numero = wa_id.replace("@c.us", "")
+            lineas_pendientes.append(f"  • @{numero}")
+            ids_menciones.append(wa_id)
+        else:
+            # Sin teléfono: solo texto plano
+            lineas_pendientes.append(f"  • {sup}")
+
+    texto = (
+        f"⚠️ *ALERTA CORTE {corte} — {fecha_str}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Los siguientes supervisores aún *no han enviado* su reporte de corte *{corte}*:\n\n"
+        + "\n".join(lineas_pendientes)
+        + f"\n\n🕐 El informe se enviará en *10 minutos*.\n"
+        f"Por favor reporten su corte a la brevedad. ¡Gracias!"
+    )
+
+    logging.info(f"Enviando alerta a grupo supervisores con {len(ids_menciones)} menciones")
+    if ids_menciones:
+        wa.send_mention(GRUPO_SUPERVISORES, texto, ids_menciones)
+    else:
+        wa.send_text(GRUPO_SUPERVISORES, texto)
+
+
+# ── Carga de todos los registros del día ─────────────────────────────────────
+
+def cargar_todos_del_dia(service, fecha_hoy: date) -> pd.DataFrame:
+    """
+    Carga TODOS los registros del día (todos los cortes) para poder
+    construir las columnas de cada hora correctamente.
+    """
+    logging.info("Leyendo todos los registros del dia...")
+    df_resp = _leer_hoja(service, "Respuestas")
+    if df_resp.empty:
+        return df_resp
+
+    df_resp["VENTA_REGULAR"] = pd.to_numeric(df_resp.get("VENTA_REGULAR", 0), errors="coerce").fillna(0).astype(int)
+    df_resp["VENTA_FLEX"] = pd.to_numeric(df_resp.get("VENTA_FLEX", 0), errors="coerce").fillna(0).astype(int)
+    df_resp["VENTA_TOTAL"] = df_resp["VENTA_REGULAR"] + df_resp["VENTA_FLEX"]
+    df_resp["CORTE"] = df_resp["CORTE"].str.strip().str.upper()
+    df_resp["FECHA_CORTE_DT"] = pd.to_datetime(
+        df_resp["FECHA_CORTE"], dayfirst=True, errors="coerce"
+    ).dt.date
+
+    return df_resp[df_resp["FECHA_CORTE_DT"] == fecha_hoy].copy()
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Informe de cortes de ventas por WhatsApp")
+    parser.add_argument(
+        "--corte",
+        required=True,
+        choices=CORTES_VALIDOS,
+        help="Corte a informar: 12PM, 2PM, 4PM, 6PM, CIERRE",
+    )
+    parser.add_argument(
+        "--fecha",
+        default=None,
+        help="Fecha en formato DD/MM/YYYY (por defecto: hoy). Para CIERRE usar la fecha del dia anterior.",
+    )
+    parser.add_argument(
+        "--alerta",
+        action="store_true",
+        help="Modo alerta: notifica al grupo de supervisores pendientes (se ejecuta 10 min antes del corte).",
+    )
+    args = parser.parse_args()
+    corte = args.corte.upper()
+
+    from datetime import timedelta
+    if args.fecha:
+        fecha = datetime.strptime(args.fecha, "%d/%m/%Y").date()
+    elif corte == "CIERRE":
+        # CIERRE: supervisores reportan al día siguiente → usamos fecha de ayer
+        fecha = date.today() - timedelta(days=1)
+        logging.info(f"Corte CIERRE: usando fecha de ayer ({fecha})")
+    else:
+        fecha = date.today()
+
+    # Conectar WhatsApp (necesario tanto para alerta como para informe)
+    import json
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    wa = WhatsAppClient(
+        host=config.get("wa_host", "localhost"),
+        port=config.get("wa_port", 8002),
+        config_path=str(CONFIG_PATH),
+    )
+    if not wa.is_ready():
+        logging.error("Servidor WhatsApp no disponible. Asegurate de que wa_server.js este corriendo.")
+        sys.exit(1)
+    logging.info("[OK] WhatsApp listo")
+
+    # Autenticar Sheets
+    service = _autenticar_sheets()
+
+    # ── Modo alerta (10 min antes del corte) ─────────────────────────────────
+    if args.alerta:
+        logging.info("=" * 60)
+        logging.info(f"ALERTA PREVIA — {corte} | {fecha.strftime('%d/%m/%Y')}")
+        logging.info("=" * 60)
+        alertar_pendientes(wa, service, corte, fecha)
+        logging.info("ALERTA PREVIA COMPLETADA")
+        return
+
+    # ── Modo informe (en el horario del corte) ────────────────────────────────
+    logging.info("=" * 60)
+    logging.info(f"INFORME CORTES — {corte} | {fecha.strftime('%d/%m/%Y')}")
+    logging.info("=" * 60)
+
+    # Leer cuotas
+    logging.info("Leyendo CUOTAS...")
+    df_cuotas = _leer_hoja(service, "CUOTAS")
+
+    # Leer todos los registros del día
+    df_todos_dia = cargar_todos_del_dia(service, fecha)
+    n_corte_actual = len(df_todos_dia[df_todos_dia["CORTE"] == corte]) if not df_todos_dia.empty else 0
+    logging.info(f"Registros del dia: {len(df_todos_dia)} | Corte {corte}: {n_corte_actual}")
+
+    if n_corte_actual == 0:
+        logging.warning(f"No hay registros para el corte {corte} del {fecha}. Continuando con ceros.")
+
+    # Calcular tablas
+    df_zonal = calcular_tabla_zonal(df_todos_dia, df_cuotas, corte, fecha)
+    df_sup = calcular_tabla_supervisor(df_todos_dia, df_cuotas, corte, fecha)
+
+    logging.info(f"Tabla zonal: {len(df_zonal)} filas | Tabla supervisores: {len(df_sup)} filas")
+
+    # Enviar
+    enviar_informe(wa, df_zonal, df_sup, corte, fecha)
+
+    logging.info("=" * 60)
+    logging.info("INFORME CORTES COMPLETADO")
+    logging.info("=" * 60)
+
+
+if __name__ == "__main__":
+    main()

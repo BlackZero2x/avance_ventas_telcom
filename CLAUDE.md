@@ -2,11 +2,35 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+  Antes de escribir o modificar cualquier código de este proyecto, aplica
+  siempre estas reglas de confidencialidad:
+
+  1. CREDENCIALES: Nunca escribas valores reales (contraseñas, usuarios,
+     servidores, tokens, API keys) directamente en el código. Toda credencial
+     debe leerse desde variables de entorno o un archivo .env, sin valores
+     por defecto que revelen datos reales. Si falta una variable requerida,
+     el script debe abortar con un mensaje de error claro.
+
+  2. DATOS PERSONALES: No incluyas nombres reales de personas, correos,
+     teléfonos ni códigos de clientes en el código fuente. Usa variables
+     de entorno o archivos de configuración externos.
+
+  3. INFRAESTRUCTURA: Evita hardcodear nombres de servidores, bases de datos,
+     DSNs, rutas de red internas o convenciones de codificación internas
+     (como tipos de venta o estados) en lugares visibles del código. Si son
+     necesarios para el funcionamiento, centralízalos en un bloque de
+     configuración claramente marcado como "ajustar en cada entorno".
+
+  4. ANTES DE VERSIONAR: Cuando vayas a preparar código para Git, revisa
+     activamente si hay credenciales, datos de clientes o información de
+     infraestructura interna que deba moverse a .env o eliminarse.
+
 ## Qué hace este proyecto
 
 **AVANCE MOVISTAR** es un sistema mensual de seguimiento de ventas para Movistar (Perú). Realiza:
-1. Extrae datos de SQL Server + archivos Excel y genera dashboards Excel de múltiples hojas
+1. Extrae datos de SQL Server + archivos Excel/CSV y genera dashboards Excel de múltiples hojas
 2. Envía archivos, capturas de pantalla y enlaces de Google Drive a grupos y contactos via WhatsApp
+3. Envía archivos por correo electrónico (Gmail API) a destinatarios específicos
 
 ## Patrón para proyectos nuevos en este repo
 
@@ -19,14 +43,18 @@ Cada nueva funcionalidad sigue esta estructura de múltiples pasos:
 ## Ejecutar el pipeline ETL principal
 
 ```bash
-# Desde C:\AVANCE_MOVISTAR — solicita el periodo (YYYY-MM) y genera los reportes Excel
+# Desde C:\proyectos\AVANCE_MOVISTAR — solicita el periodo (YYYY-MM) y genera los reportes Excel
 python AVANCE.py
 ```
 
 **Requisitos previos:**
 - SQL Server `AUREN22\AUREN`, base de datos `eAuren`, ODBC Driver 17
-- Archivos Excel en el directorio de trabajo: `rh.xlsx`, `lcf.xlsx` (opcional: `cuotas.xlsx`)
-- Paquetes Python (ver `requirements.txt`): `pandas`, `sqlalchemy`, `pyodbc`, `openpyxl`, `xlwings`, `google-api-python-client`, `pywin32`
+- Archivos Excel en el directorio de trabajo: `rh.xlsx`, `lcf.xlsx` (opcional: `cuotas.xlsx`, `cuotas_zonal_sup.xlsx`)
+- Entorno virtual compartido: `C:\proyectos\.venv\` (paquetes en `C:\proyectos\requirements.txt`)
+- Credenciales en `.env`: `SQL_SERVER`, `SQL_DATABASE`, `SQL_USER`, `SQL_PASSWORD`
+- CSV local MiFibra: ruta en `.env` como `MF_CSV_PATH`
+- Google Sheet MiFibra privado: ID en `.env` como `MF_SHEET_ID`
+- Google credentials: `credentials.json` + `token.json` en la raíz del proyecto
 
 ## Servidor y cliente de WhatsApp
 
@@ -53,7 +81,7 @@ python whatsapp_server/wa_client.py --test-link  "https://..."
 **Uso programático desde otro script Python:**
 ```python
 import sys
-sys.path.insert(0, r"C:\AVANCE_MOVISTAR\whatsapp_server")
+sys.path.insert(0, r"C:\proyectos\AVANCE_MOVISTAR\whatsapp_server")
 from wa_client import WhatsAppClient
 from msg_utils import pick_variant
 
@@ -62,6 +90,7 @@ wa.send_text("Canal Fija 2026", "Mensaje")
 wa.send_file("Back de AUREN 2025", r"C:\ruta\reporte.xlsx", caption="Reporte actualizado")
 wa.send_image("Cristian", r"C:\ruta\captura.png", caption="TDS del día")
 wa.send_link("Jesús", "https://drive.google.com/...", "Seguimiento FIJA")
+wa.send_mention("Canal Fija 2026", "Mensaje @número", ["51962969371@c.us"])
 ```
 
 El destinatario (`to`) puede ser un nombre de `config.json` o un ID directo de WhatsApp (ej. `51962969371@c.us`).
@@ -71,22 +100,24 @@ El destinatario (`to`) puede ser un nombre de `config.json` o un ID directo de W
 ### Flujo de datos
 
 ```
-SQL Server (eAuren) + Excel (rh.xlsx, lcf.xlsx, cuotas.xlsx)
+SQL Server (eAuren) + Excel (rh.xlsx, lcf.xlsx, cuotas.xlsx, cuotas_zonal_sup.xlsx)
++ CSV local (BD_Ventas_AUREN.csv) + Google Sheet privado (MF_SHEET_ID)
         ↓
     AVANCE.py  (ETL: ~3.500 líneas, 9 secciones numeradas)
         ↓
-    Salida Excel: AVANCE_RESUMIDO.xlsx + SEGUIMIENTO_VDD_FIJA_DD-MM-YYYY.xlsx
+    Salida Excel: AVANCE_{fecha}.xlsx + AVANCE_RESUMIDO.xlsx + SEGUIMIENTO_VDD_FIJA_DD-MM-YYYY.xlsx
         ↓
     wa_client.py  →  wa_server.js (puerto 8002)  →  WhatsApp
+    gmail_helper.py  →  Gmail API  →  Correo electrónico
 ```
 
 ### AVANCE.py — Secciones de procesamiento
 
 | Sección | Propósito |
 |---------|-----------|
-| 1 | Carga desde SQL (`fija_registros_totales`, `fija_altas`, etc.) + fuentes Excel |
+| 1 | Carga desde SQL (`fija_registros_totales`, `fija_altas`, etc.) + fuentes Excel + CSV MiFibra + Google Sheet MiFibra |
 | 2 | Limpieza/normalización de nulos y campos |
-| 3 | Join de datos de ventory por código FE o número de petición |
+| 3 | Join de datos de Ventory por código FE o número de petición |
 | 4 | Enriquecimiento con RH (vendedor/supervisor/zona) |
 | 5 | Cálculo de antigüedad (`<15d`, `>15d`, `>30d`, `>60d`, `>90d`), semana, normalizaciones |
 | 6 | Renombrado de columnas a nombres estándar finales |
@@ -99,20 +130,81 @@ SQL Server (eAuren) + Excel (rh.xlsx, lcf.xlsx, cuotas.xlsx)
 - `_crear_pivot()` — construye tablas dinámicas via xlwings
 - `_color_semaforo()` — aplica colores rojo (<70%) / amarillo (70–90%) / verde (>90%)
 - `calc_antiguedad()` — clasifica la antigüedad del vendedor
+- `_normalizar_zonal2(df)` — renombra `DEPARTAMENTO` → `zonal2`; para zonales con prefijo "LIMA" escribe "LIMA", para el resto copia el valor de `zonal`
 
 ### Estructura de salida Excel
 
-- **MOVISTAR / MiFibra** — datos crudos separados por servicio
-- **TDS** — dashboard principal de KPIs: rendimiento vs cuota, métricas por supervisor, semáforo, tablas dinámicas
-- **VDD1 / VDD2 / VDD3** — desglose detallado por vendedor con fórmulas Excel
-- **SEGUIMIENTO_VDD_FIJA** — copia snapshot de las hojas VDD para seguimiento con interesados
+El archivo principal `AVANCE_{fecha}.xlsx` contiene las hojas en este orden:
+
+| Hoja | Descripción |
+|------|-------------|
+| **MOVISTAR** | Datos crudos de altas Movistar |
+| **MiFibra** | Dashboard MiFibra: ventas e instalaciones por filial y plan |
+| **TDS** | Dashboard principal: KPIs por zonal (tabla 1) y por supervisor (tabla 2 y 3), semáforo, tablas dinámicas |
+| **VDD1** | Detalle por vendedor con fórmulas Excel |
+| **VDD2** | Seguimiento diario por vendedor: RT, ALTAS y CONSULTAS por día + columnas resumen últimos 3 días + ALERTAS |
+| **VDD3** | Tablas dinámicas nativas |
+| **RT** | Registros totales crudos (con campo `zonal2` normalizado) |
+| **ALTAS** | Altas crudas (con campo `zonal2` normalizado) |
+| **RH**, **VENTORY**, **CON** | Fuentes auxiliares |
+| **MES**, **DIA** | Datos para Italo (ocultas) |
+
+`SEGUIMIENTO_VDD_FIJA_{fecha}.xlsx` contiene: VDD1, VDD2 (seguimiento diario), VDD3.
+
+### Campo zonal2 (RT y ALTAS)
+
+Las hojas RT y ALTAS tienen el campo `zonal2` (renombrado desde `DEPARTAMENTO`):
+- Si `zonal` empieza con `"LIMA"` → `zonal2 = "LIMA"`
+- Cualquier otra zonal → `zonal2 = zonal` (copia exacta)
+
+Las fórmulas de TDS tabla 1 (`AVANCEMES`, días, `%Conver`, `%FLEX`) usan `Tbl_ALTAS[zonal2]` y `Tbl_RT[zonal2]` como criterio de filtro.
+
+### Hoja VDD2 — Seguimiento diario
+
+Generada por `generar_seguimiento_diario.py` (importable o standalone). Estructura:
+
+- **Fila 1**: bloques de color (DATOS DE VENDEDORES | REGISTROS TOTALES | ALTAS | CONSULTAS | RESUMEN ULTIMOS 3 DIAS | ALERTAS)
+- **Fila 2**: nombres de columna
+- **Filas 3+**: una fila por vendedor
+
+Columnas de datos VDD (A–G): ZONAL, SUPERVISOR, DNI, VENDEDOR, ANTIG, F_INGRESO (formato DD/MM/YYYY), ESQUEMA
+
+Columnas de métricas: `RT_D01`…`RT_Dnn`, `TOTAL_RT`, `ALT_D01`…`ALT_Dnn`, `TOTAL_ALT`, `CON_D01`…`CON_Dnn`, `TOTAL_CON`
+
+Columnas extra al final:
+- `RT_ULT_3D` — suma de los 3 días más recientes de RT
+- `CON_ULT_3D` — suma de los 3 días más recientes de CON
+- `ALT_ULT_3D` — suma de los 3 días más recientes de ALT
+- `ALERTAS` — fondo amarillo, negrita negra:
+  ```
+  =IF(CON_ULT_3D=0,"SIN CON ULT3D",IF(RT_ULT_3D=0,"SIN RT ULT3D",
+   IF(ALT_ULT_3D=0,"SIN ALTAS ULT3D",CONCATENATE(TOTAL_ALT," ALT"))))
+  ```
+
+Fuente global: Aptos Narrow 11.
+
+### Fuente de datos MiFibra (ALTAS.MF en VDD1)
+
+Dos fuentes combinadas, deduplicadas por `(DNI, FECHA_INST)`:
+1. **CSV local** — `MF_CSV_PATH` en `.env`: `BD_Ventas_AUREN.csv`. Filtro: `ESTADO ORDEN SERVICIO 2 == "LIQUIDADA"`. DNI vendedor: columna `NUM DOC`.
+2. **Google Sheet privado** — `MF_SHEET_ID` en `.env`. Hoja `"MiFibra"`. Acceso autenticado con `token.json` (sin publicar). Groupby por `DNI vendedor`, `FECHA DE INSTALACION`, `mes_venta`. Filtrado por mes/año del período actual.
+
+Si el Sheet no está disponible (sin red, token vencido), el proceso continúa solo con el CSV.
+
+### TDS — Tablas y captura de pantalla
+
+- **Tabla 1** (cols B–V): métricas por ZONAL. HC (col O/P) usa `SUMIF(Y:Y, B{r}, AM:AM)` — criterio exacto igual al nombre de la zonal en tabla 2.
+- **Tabla 2** (cols Y–AT): métricas por SUPERVISOR. Datos leídos dinámicamente de `cuotas_zonal_sup.xlsx` hoja `SUPERVISOR`. Bordes: fila penúltima sin borde inferior, última fila (totales) con borde inferior.
+- **Captura enviada a jefes**: `jefes_tds_rango1 = "B4:V15"` y `jefes_tds_rango2 = "Y4:AT17"` (configurables en `config.json`).
 
 ### Componentes de WhatsApp
 
-- `wa_server.js` — API Express (puerto 8002) sobre `@open-wa/wa-automate`; persiste sesión en `session_data/`; logs en `logs/wa_server_YYYY-MM-DD.log`. **Implementa cola con rate limiting: mínimo 5 segundos entre envíos cualquiera (evita bans por ráfagas rápidas)**
+- `wa_server.js` — API Express (puerto 8002) sobre **`whatsapp-web.js`** (migrado desde @open-wa); persiste sesión en `session_data/` via `LocalAuth`; usa Chrome instalado (`executablePath`); logs en `logs/wa_server_YYYY-MM-DD.log`. **Cola con rate limiting: mínimo 5 s entre envíos.**
 - `wa_client.py` — cliente HTTP Python; resuelve nombres desde `config.json`; reintenta con backoff exponencial (3 intentos)
-- `msg_utils.py` — función `pick_variant(variants, fallback)` que elige una variante de mensaje por día (hash de fecha) para evitar patrones repetitivos que activen spam-detectors de WhatsApp
-- `config.json` — IDs de WhatsApp para grupos y contactos, más plantillas de mensajes; incluye `*_variants` arrays con múltiples opciones de texto para cada destinatario
+- `msg_utils.py` — función `pick_variant(variants, fallback)` que elige una variante de mensaje por día (hash de fecha)
+- `config.json` — IDs de WhatsApp para grupos y contactos, plantillas de mensajes, rangos TDS, IDs de menciones
+
+**Menciones en whatsapp-web.js:** El endpoint `/send-mention` resuelve cada ID con `getContactById()`. Si el contacto no está en la agenda del teléfono, usa un objeto de fallback con la estructura mínima `{ id: { _serialized, user, server } }` — esto garantiza que la mención se renderice aunque el número no esté guardado.
 
 **Endpoints disponibles en wa_server.js:**
 
@@ -122,52 +214,76 @@ SQL Server (eAuren) + Excel (rh.xlsx, lcf.xlsx, cuotas.xlsx)
 | `/list-groups` | GET | Lista todos los grupos |
 | `/list-contacts?name=` | GET | Busca contactos por nombre |
 | `/send-text` | POST | Envía texto (encolado con delay) |
-| `/send-image` | POST | Envía imagen desde ruta local (base64, encolado) |
-| `/send-file` | POST | Envía archivo (xlsx, pdf, csv…) desde ruta local (encolado) |
-| `/send-mention` | POST | Envía texto con menciones (encolado) |
+| `/send-image` | POST | Envía imagen desde ruta local (encolado) |
+| `/send-file` | POST | Envía archivo desde ruta local (encolado) |
+| `/send-mention` | POST | Envía texto con menciones (resuelve contactos, encolado) |
 | `/send-link` | POST | Envía texto + URL (encolado) |
 
-**Mitigación de riesgo de ban:** El servidor Node.js implementa una cola que garantiza ≥5 s entre cualquier envío saliente, sin importar la cantidad de procesos que llamen en paralelo. Los módulos Python también insertan delays adicionales: `jefes_process.py` espera 12 s entre imágenes y 10 s antes del archivo (grupo con mayor volumen mediático). Todos los módulos usan `pick_variant()` para rotar textos diarios y evitar patrones detectables. Ver https://github.com/rmyndharis/OpenWA/blob/main/docs/16-risk-management.md para contexto de seguridad.
+**Mitigación de riesgo de ban:** Cola Node.js garantiza ≥5 s entre envíos. `jefes_process.py` espera 12 s entre imágenes y 10 s antes del archivo. Todos los módulos usan `pick_variant()` para rotar textos diarios.
 
-**Nota Windows:** La consola usa cp1252. Los prints con emojis dan `UnicodeEncodeError` — usar `[OK]`/`[ERROR]` en lugar de emojis en mensajes de consola. Para mostrar nombres de grupos con caracteres especiales usar `.encode('cp1252', errors='replace').decode('cp1252')`.
+**Nota Windows:** La consola usa cp1252. Los prints con emojis dan `UnicodeEncodeError` — usar `[OK]`/`[ERROR]`. Para mostrar nombres con caracteres especiales usar `.encode('cp1252', errors='replace').decode('cp1252')`.
 
 ## Flujo de ejecución
 
 El orquestador `main_v2.py` se dispara vía Programador de Tareas de Windows (lunes-viernes, 8:30 AM):
 
-1. **Autentica Google APIs** (Gmail, Sheets, Drive)
+1. **Autentica Google APIs** (Gmail, Sheets, Drive) con `credentials.json` + `token.json`
 2. **Revisa cada 10 min si llegó el email trigger** desde `e@auren.com.pe` con asunto `"avance_ventas - Actualización disponible"`
 3. Al detectar trigger: ejecuta `AVANCE.py` para generar archivos del día
-4. Ejecuta 6 procesos en cadena (cada uno espera 3 s tras completar):
+4. Ejecuta 7 procesos en cadena (cada uno espera 3 s tras completar):
    - `BacksProcess`: genera AVANCE_RESUMIDO → sube a Google Sheets → notifica grupo BACKS
-   - `JefesProcess`: captura rangos TDS de Excel → envía imágenes + archivo SEGUIMIENTO_VDD a grupo JEFES (con delays: 12 s entre imágenes, 10 s antes de archivo)
-   - `JesusProcess`: envía AVANCE_{fecha}.xlsx a Jesús
-   - `CristianProcess`: envía AVANCE_{fecha}.xlsx a Cristian
-   - `GuillermnoProcess`: envía AVANCE_{fecha}.xlsx a Guillermo
+   - `JefesProcess`: captura rangos TDS (`B4:V15` y `Y4:AT17`) → envía imágenes + SEGUIMIENTO_VDD_FIJA al grupo JEFES
+   - `JesusProcess`: envía AVANCE_{fecha}.xlsx a Jesús por WhatsApp
+   - `CristianProcess`: envía AVANCE_{fecha}.xlsx a Cristian por WhatsApp
+   - `GuillermnoProcess`: envía AVANCE_{fecha}.xlsx a Guillermo por WhatsApp **y por correo** a `guillermoj.hinostroza@auren.com.pe`
+   - `CarlosProcess`: envía AVANCE_{fecha}.xlsx a Carlos **solo por correo** a `carlos.parra@auren.com.pe`
    - `ItaloProcess`: sube hojas MES/DIA a Google Sheets → notifica a Italo
 5. Marca emails procesados para evitar duplicados
 6. Termina (no persiste indefinidamente)
 
-**Nota:** La verificación de WhatsApp cada mañana (`start_wa_server.bat` ejecutado por Programador de Tareas) envía notificación WhatsApp confirmando el servidor está activo.
+**Correo electrónico:** `GmailHelper` en `modules/shared/gmail_helper.py`. Usa Gmail API con la cuenta corporativa `augusto.moreno@auren.com.pe`. Nunca usar `amorenop@outlook.com` (es personal/GitHub únicamente).
+
+**Nota:** `start_wa_server.bat` ejecutado por Programador de Tareas cada mañana envía notificación WhatsApp confirmando que el servidor está activo.
 
 ## Estructura de módulos
 
-- `modules/` — scripts de procesos (backs, jefes, jesus, cristian, guillermo, italo) + `msg_utils.py` (rotación de mensajes)
-- `whatsapp_server/` — servidor Node.js (`wa_server.js`) + cliente Python (`wa_client.py`) + config
+- `modules/` — scripts de procesos (backs, jefes, jesus, cristian, guillermo, carlos, italo) + `msg_utils.py` + `shared/gmail_helper.py`
+- `whatsapp_server/` — servidor Node.js (`wa_server.js`) + cliente Python (`wa_client.py`) + `config.json`
 - `AVANCE.py` — ETL principal (~3.5k líneas, 9 secciones numeradas)
-- `generar_resumido.py` — genera AVANCE_RESUMIDO via SQL directo (sin Excel COM)
+- `generar_resumido.py` — genera AVANCE_RESUMIDO via SQL directo; hojas RTCHB/ALTASCHB incluyen zonales CHIMBOTE, NORTE CHICO y todas las que empiezan con "LIMA"
+- `generar_seguimiento_diario.py` — genera la hoja VDD2 (seguimiento diario); exportable como `agregar_hoja_seguimiento(wb, avance_path, periodo, engine)`
 - `main_v2.py` — orquestador: autentica Google, detecta trigger, ejecuta procesos
+- `run_modulo.py` — ejecutor manual de módulos individuales; autentica Google y pasa `gmail_service` a los módulos que lo requieren
+
+## Variables de entorno (.env)
+
+| Variable | Descripción |
+|----------|-------------|
+| `SQL_SERVER` | Servidor SQL (`AUREN22\AUREN`) |
+| `SQL_DATABASE` | Base de datos (`eAuren`) |
+| `SQL_USER` / `SQL_PASSWORD` | Credenciales SQL |
+| `MF_CSV_PATH` | Ruta al CSV local `BD_Ventas_AUREN.csv` |
+| `MF_SHEET_ID` | ID del Google Sheet privado de MiFibra |
+| `URL_VENTORY` / `URL_RH` / `URL_LCF` | URLs CSV públicas de Google Sheets |
+| `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` | Proxy corporativo |
+| `AVANCE_DIR` | Ruta raíz del proyecto |
+| `CHECK_INTERVAL_MINUTES` | Intervalo de polling del orquestador (default 10) |
 
 ## Glosario de términos del dominio
 
 | Término | Significado |
 |---------|-------------|
 | ALTAS | Clientes activados (ventas completadas) |
+| ALTAS.MF | Instalaciones MiFibra del período (combinación CSV + Google Sheet) |
 | TDS | Resumen Técnico de Datos — hoja principal del dashboard |
 | VDD | Detalle por Vendedor — desglose de rendimiento individual |
+| VDD2 | Seguimiento diario (reemplaza la antigua hoja de pivot diario) |
+| zonal2 | Campo normalizado: "LIMA" para cualquier sub-zonal LIMA; igual a `zonal` para el resto |
 | RH | Recursos Humanos (mapeo vendedor/supervisor/zona) |
 | LCF | Datos de riesgo crediticio (campo `RIESG`) |
 | AVANCE | Porcentaje de cumplimiento vs cuota |
 | eAuren | Nombre de la base de datos en SQL Server |
 | FE | Código interno del vendedor usado para los joins |
 | AppVentory | Sistema de registro de altas; fuente de datos sobre vendedor/petición |
+| RT | Registros Totales (todos los registros, no solo ALTAS) |
+| CON | Consultas DITO (intenciones de compra) |

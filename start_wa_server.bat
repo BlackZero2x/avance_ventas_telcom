@@ -5,37 +5,40 @@
 setlocal
 
 set NODE_EXE=C:\Program Files\nodejs\node.exe
-set SERVER_JS=C:\AVANCE_MOVISTAR\whatsapp_server\wa_server.js
-set SERVER_DIR=C:\AVANCE_MOVISTAR\whatsapp_server
-set PYTHON_EXE=C:\Users\developer2\AppData\Local\Programs\Python\Python310\python.exe
-set WA_CLIENT=C:\AVANCE_MOVISTAR\whatsapp_server\wa_client.py
-set LOG_FILE=C:\AVANCE_MOVISTAR\logs\wa_server_start.log
+set SERVER_JS=C:\proyectos\AVANCE_MOVISTAR\whatsapp_server\wa_server.js
+set SERVER_DIR=C:\proyectos\AVANCE_MOVISTAR\whatsapp_server
+set PYTHON_EXE=C:\proyectos\.venv\Scripts\python.exe
+set WA_CLIENT=C:\proyectos\AVANCE_MOVISTAR\whatsapp_server\wa_client.py
+set LOG_FILE=C:\proyectos\AVANCE_MOVISTAR\logs\wa_server_start.log
 set MY_NUMBER=51975155264@c.us
 
-echo [%date% %time%] Verificando servidor WhatsApp... >> "%LOG_FILE%"
+echo [%date% %time%] Reiniciando servidor WhatsApp (inicio de dia)... >> "%LOG_FILE%"
 
-:: Verificar si el servidor ya responde en /health
-"%PYTHON_EXE%" "%WA_CLIENT%" --health >NUL 2>&1
-if %ERRORLEVEL% EQU 0 (
-    echo [%date% %time%] Servidor WhatsApp ya esta activo. >> "%LOG_FILE%"
-    call :enviar_confirmacion
-    goto :fin
-)
-
-:: No responde — matar cualquier node residual e iniciar de nuevo
-echo [%date% %time%] Servidor no disponible. Iniciando wa_server.js... >> "%LOG_FILE%"
+:: Siempre matar node y chromium para arrancar fresco — evita sesiones caducadas o memoria acumulada
 taskkill /F /IM node.exe >NUL 2>&1
+taskkill /F /IM chrome.exe >NUL 2>&1
 ping 127.0.0.1 -n 4 >NUL
+
+:: Limpiar todos los lock files que Chrome puede dejar al cerrar mal
+set PROFILE_DIR=%SERVER_DIR%\session_data\_IGNORE_automation_session
+if exist "%PROFILE_DIR%\SingletonLock"    del /F /Q "%PROFILE_DIR%\SingletonLock"    >NUL 2>&1
+if exist "%PROFILE_DIR%\SingletonSocket"  del /F /Q "%PROFILE_DIR%\SingletonSocket"  >NUL 2>&1
+if exist "%PROFILE_DIR%\SingletonCookie"  del /F /Q "%PROFILE_DIR%\SingletonCookie"  >NUL 2>&1
+if exist "%PROFILE_DIR%\Default\LOCK"     del /F /Q "%PROFILE_DIR%\Default\LOCK"     >NUL 2>&1
+if exist "%PROFILE_DIR%\Default\lock"     del /F /Q "%PROFILE_DIR%\Default\lock"     >NUL 2>&1
+if exist "%PROFILE_DIR%\Default\lockfile" del /F /Q "%PROFILE_DIR%\Default\lockfile" >NUL 2>&1
+echo [%date% %time%] Lock files de Chromium limpiados. >> "%LOG_FILE%"
+ping 127.0.0.1 -n 3 >NUL
 
 cd /d "%SERVER_DIR%"
 start /min "wa_server" "%NODE_EXE%" "%SERVER_JS%"
 
-:: Esperar hasta 3 minutos a que el servidor este listo (36 x 5s)
+:: Esperar hasta 5 minutos a que el servidor este listo (60 x 5s)
 set intentos=0
 :esperar
 set /a intentos+=1
-if %intentos% GTR 36 (
-    echo [%date% %time%] ERROR: Servidor no respondio tras 3 minutos. >> "%LOG_FILE%"
+if %intentos% GTR 60 (
+    echo [%date% %time%] ERROR: Servidor no respondio tras 5 minutos. >> "%LOG_FILE%"
     exit /b 1
 )
 ping 127.0.0.1 -n 6 >NUL

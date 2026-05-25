@@ -6,14 +6,19 @@ Uso:
     python generar_resumido.py            # usa mes actual (YYYY-MM)
     python generar_resumido.py 2026-04    # periodo especifico
 """
+import os
 import re
 import sys
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 from sqlalchemy import create_engine
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent / '.env')
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,9 +28,11 @@ logging.basicConfig(
 
 # ── Configuracion ──────────────────────────────────────────────────────────────
 
-OUTPUT_PATH = r"C:\AVANCE_MOVISTAR\files\AVANCE_RESUMIDO.xlsx"
-SERVER      = r"AUREN22\AUREN"
-DATABASE    = "eAuren"
+OUTPUT_PATH  = r"C:\proyectos\AVANCE_MOVISTAR\files\AVANCE_RESUMIDO.xlsx"
+SERVER       = os.environ.get('SQL_SERVER',   r"AUREN22\AUREN")
+DATABASE     = os.environ.get('SQL_DATABASE', "eAuren")
+_SQL_USER    = os.environ['SQL_USER']
+_SQL_PASSWORD = os.environ['SQL_PASSWORD']
 
 SCORING_CASE = """
     CASE
@@ -94,7 +101,11 @@ DECLARE @periodoAnterior AS CHAR(7) = CONVERT(CHAR(7), DATEADD(MONTH, -1, CONVER
 
 def build_rt_query(periodo, zonal_filter, categoria="'ALTA'"):
     """Registros totales: altas del periodo + pendientes del mes."""
-    zonal_sql = f"t.zonal IN ({zonal_filter})" if "," in zonal_filter else f"t.zonal = {zonal_filter}"
+    zonal_sql = zonal_filter if zonal_filter.startswith("(") else (
+        f"t.zonal LIKE '{zonal_filter}'" if "%" in zonal_filter else (
+            f"t.zonal IN ({zonal_filter})" if "," in zonal_filter else f"t.zonal = {zonal_filter}"
+        )
+    )
     select = SELECT_ALTAS if categoria == "'ALTA'" else SELECT_MIG
     return f"""
 {_header(periodo)}
@@ -115,7 +126,11 @@ ORDER BY t.fecha_registro ASC
 
 def build_altas_query(periodo, zonal_filter, categoria="'ALTA'"):
     """Solo registros con alta confirmada en el periodo."""
-    zonal_sql = f"t.zonal IN ({zonal_filter})" if "," in zonal_filter else f"t.zonal = {zonal_filter}"
+    zonal_sql = zonal_filter if zonal_filter.startswith("(") else (
+        f"t.zonal LIKE '{zonal_filter}'" if "%" in zonal_filter else (
+            f"t.zonal IN ({zonal_filter})" if "," in zonal_filter else f"t.zonal = {zonal_filter}"
+        )
+    )
     select = SELECT_ALTAS if categoria == "'ALTA'" else SELECT_MIG
     return f"""
 {_header(periodo)}
@@ -135,15 +150,17 @@ ORDER BY t.fecha_registro ASC
 # ── Mapa de hojas ──────────────────────────────────────────────────────────────
 #  (nombre_hoja, funcion_query, zonal_filter, categoria)
 
-CHB  = "'CHIMBOTE','HUARAZ','NORTE CHICO'"
+CHB  = "'CHIMBOTE','NORTE CHICO'"
 AQP  = "'AREQUIPA'"
 TCN  = "'TACNA'"
 TRU  = "'TRUJILLO'"
 ILO  = "'ILO'"
+# CHB usa filtro mixto: IN para ciudades fijas + LIKE para todas las zonales LIMA*
+CHB_SQL = "(t.zonal IN ('CHIMBOTE','NORTE CHICO') OR t.zonal LIKE 'LIMA%')"
 
 HOJAS = [
-    ("RTCHB",       build_rt_query,    CHB, "'ALTA'"),
-    ("ALTASCHB",    build_altas_query, CHB, "'ALTA'"),
+    ("RTCHB",       build_rt_query,    CHB_SQL, "'ALTA'"),
+    ("ALTASCHB",    build_altas_query, CHB_SQL, "'ALTA'"),
     ("ALTASAQP",    build_altas_query, AQP, "'ALTA'"),
     ("RTAQP",       build_rt_query,    AQP, "'ALTA'"),
     ("RTTCN",       build_rt_query,    TCN, "'ALTA'"),
@@ -178,7 +195,7 @@ def main():
         f"DRIVER={{ODBC Driver 17 for SQL Server}};"
         f"SERVER={SERVER};"
         f"DATABASE={DATABASE};"
-        "UID={_sql_user};PWD={_sql_password};"
+        f"UID={_SQL_USER};PWD={_SQL_PASSWORD};"
     )
     engine = create_engine(f"mssql+pyodbc:///?odbc_connect={params}", fast_executemany=True)
 

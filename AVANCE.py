@@ -1,4 +1,6 @@
 import os
+import io
+import requests
 import pandas as pd
 import numpy as np
 from sqlalchemy import create_engine
@@ -138,10 +140,15 @@ def _seg_agregar_hoja(wb, avance_path, periodo, seg_engine):
                           key=lambda x: int(x.split("_D")[1]))
 
     n_base = len(col_order)
-    ci_rt_ult  = n_base + 1
-    ci_con_ult = n_base + 2
-    ci_alt_ult = n_base + 3
-    ci_alertas = n_base + 4
+    ci_rt_ult      = n_base + 1
+    ci_con_ult     = n_base + 2
+    ci_alt_ult     = n_base + 3
+    ci_alertas     = n_base + 4
+    ci_estado_vdd  = n_base + 5   # ESTADO_VENDEDOR: ACTIVO / ACTIVO SIN CIERRE / INACTIVO
+    ci_ratio_con   = n_base + 6   # RATIO_CON_A_ALT: señal predictiva (ALT_ULT3D/CON_ULT3D)
+    ci_rt_total    = n_base + 7
+    ci_alt_total   = n_base + 8
+    ci_con_total   = n_base + 9
 
     # Fila 1: encabezados de columna con color por bloque
     headers_row1, colors_row1 = [], []
@@ -155,7 +162,11 @@ def _seg_agregar_hoja(wb, avance_path, periodo, seg_engine):
         headers_row1.append(col);  colors_row1.append(_SEG_COLOR_TOT if col.startswith("TOTAL") else _SEG_COLOR_CON)
     for col in ["RT_ULT_3D", "CON_ULT_3D", "ALT_ULT_3D"]:
         headers_row1.append(col);  colors_row1.append(_SEG_COLOR_TOT)
-    headers_row1.append("ALERTAS"); colors_row1.append(_SEG_COLOR_ALERT)
+    headers_row1.append("ALERTAS");          colors_row1.append(_SEG_COLOR_ALERT)
+    headers_row1.append("ESTADO_VENDEDOR");  colors_row1.append("2E4057")   # azul oscuro
+    headers_row1.append("RATIO_CON_A_ALT"); colors_row1.append("5C4033")   # marrón (señal predictiva)
+    for col, color in [("RT_TOTAL", _SEG_COLOR_RT), ("ALT_TOTAL", _SEG_COLOR_ALT), ("CON_TOTAL", _SEG_COLOR_CON)]:
+        headers_row1.append(col);  colors_row1.append(color)
 
     for ci, (text, color) in enumerate(zip(headers_row1, colors_row1), start=1):
         cell = ws.cell(row=1, column=ci, value=text)
@@ -226,6 +237,48 @@ def _seg_agregar_hoja(wb, avance_path, periodo, seg_engine):
         ca.font      = _oxFont(name=_SEG_FNT, size=_SEG_FNT_SIZE, bold=True, color="000000")
         ca.alignment = _oxAlign(horizontal="center", vertical="center")
 
+        # ESTADO_VENDEDOR: clasifica actividad para intervención diferenciada
+        # INACTIVO = sin RT en ult 3d; ACTIVO SIN CIERRE = RT pero sin ALTAS; ACTIVO = tiene altas
+        estado_formula = (
+            f'=IF({col_rt_l}{ri}=0,"INACTIVO",'
+            f'IF({col_alt_l}{ri}=0,"ACTIVO SIN CIERRE","ACTIVO"))'
+        )
+        ce = ws.cell(row=ri, column=ci_estado_vdd, value=estado_formula)
+        ce.fill      = _seg_make_fill("2E4057")
+        ce.border    = _seg_border
+        ce.font      = _oxFont(name=_SEG_FNT, size=_SEG_FNT_SIZE, bold=True, color="FFFFFF")
+        ce.alignment = _oxAlign(horizontal="center", vertical="center")
+
+        # RATIO_CON_A_ALT: CON/ALT últimos 3d, con cap en 1 (>=1 → 1)
+        ratio_con_formula = (
+            f'=IFERROR(IF(({col_con_l}{ri}/{col_alt_l}{ri})>=1,1,{col_con_l}{ri}/{col_alt_l}{ri}),"-")'
+        )
+        cr = ws.cell(row=ri, column=ci_ratio_con, value=ratio_con_formula)
+        cr.fill          = _seg_make_fill("5C4033")
+        cr.border        = _seg_border
+        cr.font          = _oxFont(name=_SEG_FNT, size=_SEG_FNT_SIZE, color="FFFFFF")
+        cr.alignment     = _oxAlign(horizontal="center", vertical="center")
+        cr.number_format = "0.00"
+
+        # RT_TOTAL, ALT_TOTAL, CON_TOTAL — suma de todos los días del bloque
+        def _sum_all_days(day_cols_list, row_num):
+            if not day_cols_list:
+                return 0
+            refs = [f"{_ox_gcl(col_order.index(c) + 1)}{row_num}" for c in day_cols_list]
+            return f"=SUM({','.join(refs)})"
+
+        for ci_tot, day_cols_list in [
+            (ci_rt_total,  rt_day_cols),
+            (ci_alt_total, alt_day_cols),
+            (ci_con_total, con_day_cols),
+        ]:
+            ct = ws.cell(row=ri, column=ci_tot, value=_sum_all_days(day_cols_list, ri))
+            ct.fill          = fill
+            ct.border        = _seg_border
+            ct.font          = _oxFont(name=_SEG_FNT, size=_SEG_FNT_SIZE, bold=True, color="000000")
+            ct.alignment     = _oxAlign(horizontal="center", vertical="center")
+            ct.number_format = "#,##0"
+
     # Anchos
     ws.column_dimensions["A"].width = 14
     ws.column_dimensions["B"].width = 18
@@ -240,6 +293,10 @@ def _seg_agregar_hoja(wb, avance_path, periodo, seg_engine):
     for ci in [ci_rt_ult, ci_con_ult, ci_alt_ult]:
         ws.column_dimensions[_ox_gcl(ci)].width = 12
     ws.column_dimensions[_ox_gcl(ci_alertas)].width = 18
+    ws.column_dimensions[_ox_gcl(ci_estado_vdd)].width = 18
+    ws.column_dimensions[_ox_gcl(ci_ratio_con)].width = 14
+    for ci in [ci_rt_total, ci_alt_total, ci_con_total]:
+        ws.column_dimensions[_ox_gcl(ci)].width = 11
 
     ws.row_dimensions[1].height = 25
     ws.freeze_panes = ws.cell(row=2, column=len(_SEG_COLS_VDD) + 1)
@@ -675,6 +732,7 @@ WITH realme AS (
         t.velocidad_ba,
         t.cms_codsrv,
 		t.destinopaquete,
+		t.desc_estado_peticion,
         cd.dni_vendedor AS dni_vendedor_cd,
         cx.dni_vendedor AS dni_vendedor_cx,
         COALESCE(cd.dni_vendedor, cx.dni_vendedor) AS dnivddcnet
@@ -828,7 +886,7 @@ NULL AS NUMERO_TELEFONO,
 NULL AS FEC_REG_PETICION,
 NULL AS FECHACAMBIOESTADO,
 NULL AS ESTADO_PETICION,
-NULL AS DESC_ESTADO_PETICION,
+desc_estado_peticion AS DESC_ESTADO_PETICION,
 NULL AS ESTADO_SUBPET_ORIGEN,
 NULL AS ESTADO_SUBPET_DESTINO,
 NULL AS DESC_ESTADO_SUBPET_DESTINO,
@@ -995,7 +1053,7 @@ NULL AS CMS_DESC_PRODUCTO,
 NULL AS Region_Vendedor2,
 NULL AS MATCH_CONVER,
 NULL AS TRUEFALSE,
-NULL AS Semana,
+'S' + CAST(DATEPART(WEEK, Fecha_Registro) - DATEPART(WEEK, DATEADD(MONTH, DATEDIFF(MONTH, 0, Fecha_Registro), 0)) + 1 AS VARCHAR(2)) AS Semana,
 dnivddcnet
 FROM realme
 ORDER BY Fecha_Registro ASC;
@@ -1030,8 +1088,14 @@ engine.dispose()
 # ── Google Sheets: VENTORY y RH ────────────────────────────────
 URL_VENTORY = os.environ.get("URL_VENTORY", "https://docs.google.com/spreadsheets/d/e/2PACX-1vSXxqrGGs4_mU4n511v3zBkKo4buAFv0TwrlrrX4XD2jFjIT7cC8kvH7ER32Ye2hiOpo3mAFsUkyydg/pub?gid=22270598&single=true&output=csv")
 URL_RH      = os.environ.get("URL_RH",      "https://docs.google.com/spreadsheets/d/e/2PACX-1vSXxqrGGs4_mU4n511v3zBkKo4buAFv0TwrlrrX4XD2jFjIT7cC8kvH7ER32Ye2hiOpo3mAFsUkyydg/pub?gid=241856834&single=true&output=csv")
-ventory = pd.read_csv(URL_VENTORY)
-rh      = pd.read_csv(URL_RH)
+def _read_gsheet_csv(url):
+    """Lee un CSV publicado de Google Sheets forzando UTF-8 (el header HTTP reporta ISO-8859-1 incorrectamente)."""
+    resp = requests.get(url, timeout=60)
+    return pd.read_csv(io.BytesIO(resp.content), encoding="utf-8")
+
+ventory = _read_gsheet_csv(URL_VENTORY)
+rh      = _read_gsheet_csv(URL_RH)
+rh["ESQUEMA"] = rh["ESQUEMA"].replace("PART-TIME", "PLANILLA")
 _MF_CSV = Path(os.environ.get("MF_CSV_PATH", r"C:\Users\developer2\Documents\vpncompartido\BD_Ventas_AUREN.csv"))
 _mf_raw = pd.read_csv(_MF_CSV, encoding="utf-8-sig", low_memory=False)
 # La columna AÑO_REG puede tener la ñ corrupta según el encoding del CSV
@@ -1076,7 +1140,11 @@ if _MF_SHEET_ID:
             )
             _vals = _resp.get("values", [])
             if len(_vals) > 1:
-                _mf_sheet_df = pd.DataFrame(_vals[1:], columns=_vals[0])
+                _hdr = _vals[0]
+                _n   = len(_hdr)
+                # Padear filas cortas con "" para evitar "X columns passed, data had Y columns"
+                _rows = [r + [""] * (_n - len(r)) if len(r) < _n else r[:_n] for r in _vals[1:]]
+                _mf_sheet_df = pd.DataFrame(_rows, columns=_hdr)
                 print(f"[OK] MiFibra Sheet: {len(_mf_sheet_df)} filas descargadas")
             else:
                 print("[AVISO] MiFibra Sheet: hoja vacia o sin datos")
@@ -1226,7 +1294,7 @@ df["SUP1"]           = ""
 
 URL_LCF = os.environ.get("URL_LCF", "https://docs.google.com/spreadsheets/d/e/2PACX-1vR_9W58TW-lTrt6_sb4bSgWKkfdcYGV0KXjxKwps0l3qOLGz3MR_eA27hnbAFmBegu85U9jzG5yqe9v/pub?gid=1443303762&single=true&output=csv")
 
-lcf = pd.read_csv(URL_LCF)
+lcf = _read_gsheet_csv(URL_LCF)
 lcf["PETICION"] = pd.to_numeric(lcf["PETICION"], errors="coerce").astype("Int64")
 
 df = df.merge(
@@ -1338,8 +1406,38 @@ else:
 zona_col = "ZONAL" if "ZONAL" in rh.columns else "ZONA"
 f_ing_col = next((c for c in ["F_INGRESO", "F_ING"] if c in rh.columns), None)
 
-# ── Feriados por mes (Perú) ───────────────────────────────────
-FERIADOS_MES = {4:2, 5:1, 6:1, 7:2, 8:1, 9:0, 10:1, 11:1, 12:3}
+# ── Feriados nacionales de Perú (fechas exactas) ─────────────
+# Usadas para descontar de días hábiles transcurridos y totales del mes.
+# Actualizar cada año si cambian las fechas de feriados variables (Semana Santa, etc.).
+FERIADOS_PERU = [
+    pd.Timestamp("2026-01-01"),  # Año Nuevo
+    pd.Timestamp("2026-04-02"),  # Jueves Santo
+    pd.Timestamp("2026-04-03"),  # Viernes Santo
+    pd.Timestamp("2026-05-01"),  # Día del Trabajo
+    pd.Timestamp("2026-06-29"),  # San Pedro y San Pablo
+    pd.Timestamp("2026-07-28"),  # Fiestas Patrias
+    pd.Timestamp("2026-07-29"),  # Fiestas Patrias
+    pd.Timestamp("2026-08-30"),  # Santa Rosa de Lima
+    pd.Timestamp("2026-10-08"),  # Combate de Angamos
+    pd.Timestamp("2026-11-01"),  # Todos los Santos
+    pd.Timestamp("2026-12-08"),  # Inmaculada Concepción
+    pd.Timestamp("2026-12-25"),  # Navidad
+]
+
+def _feriados_en_rango(f_inicio, f_fin):
+    """Cuenta feriados nacionales que caen en días laborables (lun-sab) dentro del rango."""
+    return sum(
+        1 for f in FERIADOS_PERU
+        if f_inicio <= f <= f_fin and f.weekday() < 6
+    )
+
+def _dias_lab(f_inicio, f_fin):
+    """Días laborables (lun-sab) entre dos fechas inclusive, descontando feriados."""
+    bruto = sum(1 for d in pd.date_range(f_inicio, f_fin) if d.weekday() < 6)
+    return max(bruto - _feriados_en_rango(f_inicio, f_fin), 1)
+
+# Conteo por mes para compatibilidad (NETWORKDAYS en TDS ya no se usa, pero se mantiene)
+FERIADOS_MES = {m: sum(1 for f in FERIADOS_PERU if f.month == m and f.weekday() < 6) for m in range(1, 13)}
 
 # ── Antigüedad ────────────────────────────────────────────────
 def calc_antiguedad(f_ing):
@@ -1571,25 +1669,25 @@ _mf_csv_ventas = _mf_csv_ventas.rename(columns={
 _mf_gs_ventas = pd.DataFrame()
 if not _mf_sheet_df.empty:
     try:
-        # Detectar columnas clave por nombre (tolerante a variaciones)
-        _col_dni  = next((c for c in _mf_sheet_df.columns if "DOC" in c.upper()), None)
-        _col_fech = next((c for c in _mf_sheet_df.columns if "INSTALAC" in c.upper()), None)
-        _col_mes  = next((c for c in _mf_sheet_df.columns if "MES" in c.upper() and "VENTA" in c.upper()), None)
+        # Detectar columnas clave por nombre (tolerante a tildes y variaciones)
+        import unicodedata
+        def _norm(s):
+            return unicodedata.normalize("NFD", s.upper()).encode("ascii", "ignore").decode()
+        _col_dni  = next((c for c in _mf_sheet_df.columns if "DNI" in _norm(c) and "VEND" in _norm(c)), None) \
+                 or next((c for c in _mf_sheet_df.columns if "DOC" in _norm(c) and "VEND" in _norm(c)), None)
+        _col_fech = next((c for c in _mf_sheet_df.columns if "INSTALAC" in _norm(c)), None)
+        _col_mes  = next((c for c in _mf_sheet_df.columns if "MES" in _norm(c) and "VENTA" in _norm(c)), None)
         if _col_dni and _col_fech:
             _tmp = _mf_sheet_df[[_col_dni, _col_fech] + ([_col_mes] if _col_mes else [])].copy()
             _tmp = _tmp.rename(columns={_col_dni: "DNI", _col_fech: "FECHA_INST"})
-            if _col_mes:
-                _tmp = _tmp.rename(columns={_col_mes: "MES_VENTA"})
-                _tmp["MES_VENTA"] = pd.to_numeric(_tmp["MES_VENTA"], errors="coerce")
-                _tmp = _tmp[_tmp["MES_VENTA"] == _mes_num]
-            else:
-                # Derivar mes desde FECHA_INST si no hay columna MES_VENTA
-                _tmp["FECHA_INST"] = pd.to_datetime(_tmp["FECHA_INST"], errors="coerce", dayfirst=True)
-                _tmp["MES_VENTA"]  = _tmp["FECHA_INST"].dt.month
-                _tmp = _tmp[_tmp["MES_VENTA"] == _mes_num]
-                # Filtrar también por año
-                _tmp = _tmp[_tmp["FECHA_INST"].dt.year == _anio_num]
-            _mf_gs_ventas = _tmp[["DNI", "FECHA_INST", "MES_VENTA"]].copy()
+            # Siempre derivar mes/año desde FECHA_INST para evitar problemas de formato en mes_venta
+            _tmp["FECHA_INST"] = pd.to_datetime(_tmp["FECHA_INST"], errors="coerce", dayfirst=True)
+            _tmp = _tmp.dropna(subset=["FECHA_INST"])
+            _tmp["_mes"]  = _tmp["FECHA_INST"].dt.month
+            _tmp["_anio"] = _tmp["FECHA_INST"].dt.year
+            _tmp = _tmp[(_tmp["_mes"] == _mes_num) & (_tmp["_anio"] == _anio_num)]
+            _mf_gs_ventas = _tmp[["DNI", "FECHA_INST"]].copy()
+            _mf_gs_ventas["MES_VENTA"] = _mes_num
             print(f"[OK] MiFibra Sheet filtrado: {len(_mf_gs_ventas)} ventas del periodo {PERIODO}")
         else:
             print("[AVISO] MiFibra Sheet: no se encontraron columnas DNI/FECHA_INSTALACION")
@@ -1665,21 +1763,20 @@ vdd1["%Conver"]       = 0.0   # placeholder; se reemplaza con fórmula Excel al 
 vdd1["RATIO_CON"]     = 0.0   # placeholder; se reemplaza con fórmula Excel al exportar
 vdd1["CUOTA"]         = vdd1["CUOTA"].fillna(8).astype(int)   # default 8 si no está en cuotas.xlsx
 
-# PROYECT.ALT = (ALTAS / dias_lab_transcurridos) * (dias_lab_totales_mes - feriados_mes)
-# dias_lab_transcurridos = días hábiles entre min(Fecha_Alta) y max(Fecha_Alta) del periodo
-# dias_lab_totales_mes   = días hábiles entre min(Fecha_Alta) y fin de mes
-_fechas_alta = df["Fecha_de_alta"].dropna()
+# PROYECT.ALT = (ALTAS / dias_lab_transcurridos) * dias_lab_totales_mes
+# dias_lab_transcurridos = días hábiles desde el 01 del mes hasta la última alta registrada
+# dias_lab_totales_mes   = días hábiles totales del mes (01 a fin de mes)
+# Ambos descontan feriados nacionales peruanos que caigan en lun-vie.
+_f_inicio_mes = pd.Timestamp(PERIODO + "-01")
+_f_fin_mes    = _f_inicio_mes + pd.offsets.MonthEnd(0)
+_fechas_alta  = df["Fecha_de_alta"].dropna()
 if len(_fechas_alta) > 0:
-    _f_min = _fechas_alta.min()
     _f_max = _fechas_alta.max()
-    _f_fin_mes = _f_min + pd.offsets.MonthEnd(0)
-    _mes = _f_min.month
-    _feriados = FERIADOS_MES.get(_mes, 0)
-    _dias_lab_trans  = max(len(pd.bdate_range(_f_min, _f_max)), 1)
-    _dias_lab_totmes = max(len(pd.bdate_range(_f_min, _f_fin_mes)) - _feriados, 1)
+    _dias_lab_trans  = _dias_lab(_f_inicio_mes, _f_max)
+    _dias_lab_totmes = _dias_lab(_f_inicio_mes, _f_fin_mes)
 else:
     _dias_lab_trans  = 1
-    _dias_lab_totmes = 1
+    _dias_lab_totmes = _dias_lab(_f_inicio_mes, _f_fin_mes)
 
 vdd1["PROYECT.ALT"]   = (vdd1["ALTAS"] / _dias_lab_trans * _dias_lab_totmes).round(0).astype(int)
 vdd1["PROY_VS_CUOTA"] = np.where(
@@ -2197,14 +2294,17 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
     # ════════════════════════════════════════════════════
     # FILA _r_param — parámetros días laborables
     # ════════════════════════════════════════════════════
+    # B = días hábiles transcurridos (ya descuenta feriados peruanos del rango)
     _set(ws_tds, _r_param, column_index_from_string("B"),
-         "=NETWORKDAYS.INTL(MIN(Tbl_ALTAS[Fecha_Alta]),MAX(Tbl_ALTAS[Fecha_Alta]),11)",
+         _dias_lab_trans,
          font=_f(size=10), aln=_aln("center","center"))
+    # C = días hábiles restantes = D - B
     _set(ws_tds, _r_param, column_index_from_string("C"),
          f"=+D{_r_param}-B{_r_param}",
          font=_f(size=10), aln=_aln("center","center"))
+    # D = días hábiles totales del mes (ya descuenta feriados peruanos del mes)
     _set(ws_tds, _r_param, column_index_from_string("D"),
-         f"=NETWORKDAYS.INTL(MIN(Tbl_ALTAS[Fecha_Alta]),EOMONTH(MIN(Tbl_ALTAS[Fecha_Alta]),0),11)-{FERIADOS_MES.get(inicio_mes.month, 0)}",
+         _dias_lab_totmes,
          font=_f(size=10), aln=_aln("center","center"))
 
     # ════════════════════════════════════════════════════
@@ -2233,6 +2333,7 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
         ("AR", "ALTAS PDTE",           _FILL_NARAN2,True),
         ("AS", "RUS",                  _FILL_VIO,   True),
         ("AT", "ALTAS",                _FILL_ROJO,  True),
+        ("AU", "RIESGO CUOTA",         _FILL_ROJO,  True),
     ]
     for col_l, txt, fill, bold in _HDR2:
         _set(ws_tds, 5, column_index_from_string(col_l), txt,
@@ -2290,7 +2391,7 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
         _set(ws_tds, r, column_index_from_string("AQ"),
              f'=IFERROR(SUMIFS(Tbl_ALTAS[Q],Tbl_ALTAS[SUP_CNET],TDS!${Zc},Tbl_ALTAS[Scoring],"FLEX")/{ABc},"-")',
              font=_f(size=11), aln=_aln("center","center"), fmt="0%")
-        ARc = f"AR{r}"; ATc = f"AT{r}"
+        ARc = f"AR{r}"; ATc = f"AT{r}"; ALc = f"AL{r}"
         _set(ws_tds, r, column_index_from_string("AR"),
              f'=IF((TDS!${AAc}-TDS!${ABc})<0,0,(TDS!${AAc}-TDS!${ABc}))',
              font=_f(size=11), aln=_aln("center","center"), fmt="#,##0")
@@ -2300,6 +2401,10 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
         _set(ws_tds, r, column_index_from_string("AS"),
              f'=IFERROR(IF(ROUND({ATc}/AP{r},0)={ATc},{ATc}+1,ROUND({ATc}/AP{r},0)),"-")',
              font=_f(size=11), aln=_aln("center","center"), fmt="0")
+        # RIESGO CUOTA: semáforo textual basado en %PROY (AL) y días restantes
+        _set(ws_tds, r, column_index_from_string("AU"),
+             f'=IF({ALc}="","-",IF({ALc}<0.7,"CRITICO",IF({ALc}<0.85,"EN RIESGO","OK")))',
+             font=_f(bold=True, size=11, color="FFFFFF"), aln=_aln("center","center"))
 
     # ════════════════════════════════════════════════════
     # TABLA 3 — por SUPERVISOR (LCF), ahora en AW5
@@ -3604,7 +3709,11 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
             _force_font_ws(writer.sheets[_ws_name])
 
 print(f"Archivo generado (openpyxl): {ruta}")
-import time; time.sleep(3)  # dar tiempo al OS a liberar el handle antes de que xlwings lo abra
+
+import shutil as _shutil
+import subprocess as _sp
+
+ruta_tmp = ruta.parent / (ruta.stem + "_tmp.xlsx")
 
 # ════════════════════════════════════════════════════════════
 # TABLAS DINÁMICAS — xlwings (requiere Excel instalado)
@@ -3732,13 +3841,70 @@ def _color_semaforo(ws_api, cell_addr, valor):
     ws_api.Range(cell_addr).Interior.Color = bgr
 
 
+def _matar_excel_zombis():
+    """Termina procesos EXCEL.EXE que no tienen ventana principal visible.
+
+    Un proceso Excel sin MainWindowHandle es un zombi dejado por una ejecución
+    anterior que crasheó antes del app.quit(). El taskkill /FI WINDOWTITLE no
+    los alcanza porque no tienen título visible; WMI sí los encuentra por PID.
+    Solo mata los procesos sin ventana para no afectar al Excel del usuario.
+    """
+    import subprocess as _sub
+    try:
+        # Obtener PIDs de todos los EXCEL.EXE sin ventana principal (MainWindowHandle == 0)
+        ps_cmd = (
+            "Get-Process excel -ErrorAction SilentlyContinue "
+            "| Where-Object { $_.MainWindowHandle -eq 0 } "
+            "| Select-Object -ExpandProperty Id"
+        )
+        result = _sub.run(
+            ["powershell", "-NonInteractive", "-Command", ps_cmd],
+            capture_output=True, text=True, timeout=15,
+        )
+        pids = [p.strip() for p in result.stdout.splitlines() if p.strip().isdigit()]
+        for pid in pids:
+            _sub.run(["taskkill", "/F", "/PID", pid], capture_output=True, timeout=10)
+            print(f"[AVANCE] Excel zombi terminado (PID {pid})")
+    except Exception as _e:
+        print(f"[AVANCE] Aviso _matar_excel_zombis: {_e}")
+
+
+def _cerrar_excel_con_archivo(ruta_str):
+    """Cierra via ROT cualquier instancia de Excel que tenga abierto el archivo."""
+    import pythoncom
+    import win32com.client
+
+    nombre = os.path.basename(ruta_str).lower()
+    try:
+        context = pythoncom.CreateBindCtx(0)
+        rot = pythoncom.GetRunningObjectTable()
+        for moniker in rot:
+            try:
+                display_name = moniker.GetDisplayName(context, None)
+            except Exception:
+                continue
+            if "excel" not in display_name.lower():
+                continue
+            try:
+                obj = rot.GetObject(moniker)
+                xl = win32com.client.Dispatch(obj.QueryInterface(pythoncom.IID_IDispatch))
+                for wb_open in xl.Workbooks:
+                    if os.path.basename(wb_open.FullName).lower() == nombre:
+                        wb_open.Close(SaveChanges=False)
+                        print(f"[AVANCE] Cerrado libro abierto en instancia previa: {wb_open.FullName}")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _abrir_libro_excel(ruta_str):
     """Abre el libro en una instancia COM completamente aislada del Excel del usuario.
 
-    Usa DispatchEx en lugar de Dispatch para forzar un proceso Excel.exe nuevo
-    que no comparte ROT (Running Object Table) con instancias existentes.
-    Esto evita el error "workbook with same name already open" incluso cuando
-    el usuario tiene Excel abierto con otros archivos.
+    Usa DispatchEx para forzar un proceso Excel.exe nuevo que no comparte ROT
+    con instancias existentes. Se espera que ruta_str sea siempre un archivo
+    _tmp cuyo nombre no coincide con ningún libro abierto, por lo que el error
+    de bloqueo no debería ocurrir.
     """
     import pythoncom
     import win32com.client
@@ -3746,13 +3912,11 @@ def _abrir_libro_excel(ruta_str):
     # CoInitialize para el hilo actual (necesario cuando viene de subprocess)
     pythoncom.CoInitialize()
 
-    # DispatchEx crea siempre un proceso Excel nuevo y aislado (no reutiliza el del usuario)
     xl_com = win32com.client.DispatchEx("Excel.Application")
     xl_com.Visible = True
     xl_com.DisplayAlerts = False
     xl_com.AskToUpdateLinks = False
 
-    # Abrir el libro en esa instancia aislada
     wb_com = xl_com.Workbooks.Open(
         os.path.normpath(ruta_str),
         UpdateLinks=False,
@@ -3784,7 +3948,47 @@ def _abrir_libro_excel(ruta_str):
     return app_xw, wb_xw, xl_com
 
 
-app, wb, _xl_com = _abrir_libro_excel(str(ruta))
+# ── Capa 1: matar procesos Excel zombis (sin ventana) de ejecuciones anteriores ──
+_matar_excel_zombis()
+
+# ── Capa 2: cerrar via ROT y eliminar cualquier _tmp previo bloqueado ──
+import time as _time
+
+def _eliminar_tmp_con_reintento(path, intentos=5, espera=3):
+    """Intenta eliminar el archivo esperando entre reintentos.
+
+    Después de matar zombis puede tomar unos segundos que Windows libere
+    el handle. Con 5 intentos × 3 s cubrimos hasta 15 s de latencia.
+    """
+    _cerrar_excel_con_archivo(str(path))
+    for i in range(intentos):
+        try:
+            path.unlink()
+            return True
+        except PermissionError:
+            if i < intentos - 1:
+                _time.sleep(espera)
+        except FileNotFoundError:
+            return True
+        except Exception as _e:
+            print(f"[AVANCE] No se pudo eliminar _tmp (intento {i+1}): {_e}")
+            return False
+    print(f"[AVANCE] _tmp sigue bloqueado tras {intentos} intentos: {path.name}")
+    return False
+
+if ruta_tmp.exists():
+    _eliminar_tmp_con_reintento(ruta_tmp)
+
+# ── Capa 3: usar nombre con timestamp para garantizar unicidad absoluta ──
+# Si contra todo pronóstico el _tmp fijo sigue bloqueado, el nombre con
+# timestamp nunca colisiona con ningún libro abierto.
+import datetime as _dt
+_ts = _dt.datetime.now().strftime("%H%M%S")
+ruta_tmp = ruta.parent / f"{ruta.stem}_tmp_{_ts}.xlsx"
+
+_shutil.copy2(str(ruta), str(ruta_tmp))
+
+app, wb, _xl_com = _abrir_libro_excel(str(ruta_tmp))
 try:
     wb_api  = wb.api
     ws_vdd3 = wb.sheets["VDD3"]
@@ -3802,10 +4006,14 @@ try:
         filter_visible_items = ["PLANILLA", "PART-TIME"],
     )
 
-    # Calcular dinámica la fila de inicio de la segunda tabla:
-    # última fila ocupada por TablaDinamica1 + 3 filas de separación
-    _pt1_last_row = pt1.TableRange2.Row + pt1.TableRange2.Rows.Count - 1
-    _pt2_start_row = _pt1_last_row + 3
+    # Calcular dinámica la fila de inicio de la segunda tabla.
+    # Se toma el máximo entre TableRange2 y UsedRange porque TableRange2
+    # puede quedar corto si la pivot aún no terminó de expandirse.
+    _pt1_last_row = max(
+        pt1.TableRange2.Row + pt1.TableRange2.Rows.Count - 1,
+        ws_vdd3.api.UsedRange.Row + ws_vdd3.api.UsedRange.Rows.Count - 1,
+    )
+    _pt2_start_row = _pt1_last_row + 5   # 5 filas de separación
     _pt2_dest = f"A{_pt2_start_row}"
 
     # ── Tabla dinámica 2 — ANTIG: <15d + >15d ────────────────────
@@ -3842,6 +4050,23 @@ try:
             _val = ws_tds.api.Range(_cell_addr).Value
             _color_semaforo(ws_tds.api, _cell_addr, _val)
 
+    # Ancho columna AU (RIESGO CUOTA)
+    ws_tds.api.Columns("AU").ColumnWidth = 11
+
+    # Semáforo columna AU (RIESGO CUOTA) por supervisores — texto con fondo de color
+    for _row_i in range(_r0, _r_sup_last + 1):
+        _addr = f"AU{_row_i}"
+        _val  = ws_tds.api.Range(_addr).Value
+        if _val == "CRITICO":
+            ws_tds.api.Range(_addr).Interior.Color = 16278891   # rojo  #F8696B
+            ws_tds.api.Range(_addr).Font.Color     = 16777215   # blanco
+        elif _val == "EN RIESGO":
+            ws_tds.api.Range(_addr).Interior.Color = 16772996   # amarillo #FFEB84
+            ws_tds.api.Range(_addr).Font.Color     = 0          # negro
+        elif _val == "OK":
+            ws_tds.api.Range(_addr).Interior.Color = 6537339    # verde #63BE7B
+            ws_tds.api.Range(_addr).Font.Color     = 0          # negro
+
     # ── Reordenar hojas: MOVISTAR, MiFibra, TDS, VDD1, VDD2, VDD3, resto ──
     _ORDEN_HOJAS = ["MOVISTAR", "MiFibra", "TDS", "VDD1", "VDD2", "VDD3"]
     _nombres_actuales = [s.name for s in wb.sheets]
@@ -3854,8 +4079,31 @@ try:
     # ── Al abrir el libro debe quedar activa la hoja TDS ─────────
     wb.sheets["TDS"].api.Activate()
 
+    # ── Generar libro AVANCE_VTAS_APPVENTORY con hojas MES y DIA ──
+    # (debe hacerse ANTES de wb.close() porque necesita wb.sheets activo)
+    _ruta_vtas = _dir_salida / f"AVANCE_VTAS_APPVENTORY_{ayer}.xlsx"
+    wb_vtas = app.books.add()
+
+    for _nombre_hoja in ["MES", "DIA"]:
+        _sh_origen = wb.sheets[_nombre_hoja]
+        _sh_origen.api.Copy(After=wb_vtas.sheets[-1].api)
+        _copied = wb_vtas.sheets[-1]
+        _copied.name = _nombre_hoja
+        _copied.api.Visible = True
+
+    wb_vtas.sheets[0].api.Delete()
+
+    wb_vtas.save(str(_ruta_vtas))
+    wb_vtas.close()
+    print(f"Ventas AppVentory generado: {_ruta_vtas}")
+
     wb.save()
     wb.close()
+    # Reemplazar el archivo definitivo con el _tmp ya procesado por COM
+    import os as _os
+    if ruta.exists():
+        _os.remove(str(ruta))
+    _os.rename(str(ruta_tmp), str(ruta))
     print("Tablas dinámicas creadas, hojas reordenadas, semáforo aplicado.")
 
     # ── Agregar hoja VDD2 (seguimiento diario) al archivo principal ──
@@ -3873,61 +4121,54 @@ try:
         print(f"[AVANCE] Aviso: no se pudo agregar hoja VDD2 al principal: {_e_seg_principal}")
 
     # ── Generar libro SEGUIMIENTO_VDD_FIJA con copia de VDD1/VDD2/VDD3 ──
+    # copy_worksheet() de openpyxl solo funciona dentro del mismo workbook.
+    # Solución: cargar el principal, eliminar las hojas que no son VDD y guardar con otro nombre.
     from datetime import date, timedelta
     _ayer = date.today() - timedelta(days=1)
     _fecha_str = _ayer.strftime("%d-%m-%Y")
     _ruta_seg  = _dir_salida / f"SEGUIMIENTO_VDD_FIJA_{_fecha_str}.xlsx"
 
-    # Reabrir el archivo principal con xlwings para copiar hojas VDD
-    wb = app.books.open(str(ruta))
-
-    # El libro nuevo tiene 1 hoja vacía; se usa como ancla para el primer Copy
-    wb_seg = app.books.add()
-
-    for _nombre_hoja in ["VDD1", "VDD3"]:
-        _sh_origen = wb.sheets[_nombre_hoja]
-        # Copy con After= última hoja de wb_seg → la copia queda al final
-        _sh_origen.api.Copy(After=wb_seg.sheets[-1].api)
-        wb_seg.sheets[-1].name = _nombre_hoja
-
-    # Eliminar la hoja vacía inicial que Excel creó al abrir el libro nuevo
-    wb_seg.sheets[0].api.Delete()
-
-    # Guardar primero con xlwings (VDD1/VDD3)
-    wb_seg.save(str(_ruta_seg))
-    wb_seg.close()
-
-    # ── Agregar hoja VDD2 (seguimiento diario) al SEGUIMIENTO_VDD_FIJA ──
     try:
-        _wb_seg_opxl = _openpyxl.load_workbook(str(_ruta_seg))
-        _seg_agregar_hoja(_wb_seg_opxl, ruta, PERIODO, engine)
-        # Reordenar: VDD1, VDD2, VDD3
-        _sheetnames = _wb_seg_opxl.sheetnames
-        _idx_vdd2   = _sheetnames.index("VDD2")
-        _wb_seg_opxl.move_sheet("VDD2", offset=1 - _idx_vdd2)
-        _wb_seg_opxl.save(str(_ruta_seg))
-        print("[AVANCE] Hoja VDD2 agregada al libro SEGUIMIENTO_VDD_FIJA.")
+        # Paso 1: abrir con Excel via xlwings para calcular y extraer valores de
+        # %Conver (col 13) y RATIO_CON (col 14), que referencian hojas que se
+        # eliminarán (CON, TDS). Guardamos los valores antes de que las referencias
+        # se rompan al borrar esas hojas.
+        _valores_conver   = {}  # {fila: valor}
+        _valores_ratio    = {}
+        try:
+            _xl_seg = xw.App(visible=False)
+            _xl_seg.display_alerts = False
+            _wb_xw = _xl_seg.books.open(str(ruta))
+            _ws_xw = _wb_xw.sheets["VDD1"]
+            _last_row_seg = _ws_xw.range("A1").current_region.last_cell.row
+            for _r in range(2, _last_row_seg + 1):
+                _valores_conver[_r] = _ws_xw.range(f"M{_r}").value
+                _valores_ratio[_r]  = _ws_xw.range(f"N{_r}").value
+            _wb_xw.close()
+            _xl_seg.quit()
+        except Exception as _e_xw_seg:
+            print(f"[AVANCE] Aviso SEGUIMIENTO: no se pudieron extraer valores via xlwings: {_e_xw_seg}")
+
+        # Paso 2: cargar con openpyxl, eliminar hojas auxiliares y pegar valores
+        _wb_seg2 = _openpyxl.load_workbook(str(ruta))
+        _hojas_mantener = {"VDD1", "VDD2", "VDD3"}
+        for _hn in [s for s in _wb_seg2.sheetnames if s not in _hojas_mantener]:
+            del _wb_seg2[_hn]
+
+        # Reemplazar fórmulas con referencias rotas por los valores calculados
+        if _valores_conver:
+            _ws_seg_v1 = _wb_seg2["VDD1"]
+            for _r, _val in _valores_conver.items():
+                _ws_seg_v1.cell(row=_r, column=13).value = _val if _val is not None else 0
+            for _r, _val in _valores_ratio.items():
+                _ws_seg_v1.cell(row=_r, column=14).value = _val if _val is not None else 0
+
+        _wb_seg2.save(str(_ruta_seg))
+        print(f"[AVANCE] SEGUIMIENTO_VDD_FIJA generado: {_ruta_seg.name}")
     except Exception as _e_seg:
-        print(f"[AVANCE] Aviso: no se pudo agregar hoja VDD2 al SEGUIMIENTO_VDD_FIJA: {_e_seg}")
+        print(f"[AVANCE] Aviso: no se pudo generar SEGUIMIENTO_VDD_FIJA: {_e_seg}")
 
     print(f"Seguimiento generado: {_ruta_seg}")
-
-    # ── Generar libro AVANCE_VTAS_APPVENTORY con hojas MES y DIA ──
-    _ruta_vtas = _dir_salida / f"AVANCE_VTAS_APPVENTORY_{ayer}.xlsx"
-    wb_vtas = app.books.add()
-
-    for _nombre_hoja in ["MES", "DIA"]:
-        _sh_origen = wb.sheets[_nombre_hoja]
-        _sh_origen.api.Copy(After=wb_vtas.sheets[-1].api)
-        _copied = wb_vtas.sheets[-1]
-        _copied.name = _nombre_hoja
-        _copied.api.Visible = True
-
-    wb_vtas.sheets[0].api.Delete()
-
-    wb_vtas.save(str(_ruta_vtas))
-    wb_vtas.close()
-    print(f"Ventas AppVentory generado: {_ruta_vtas}")
 finally:
     try:
         wb.close()
@@ -3944,6 +4185,12 @@ finally:
     try:
         import pythoncom
         pythoncom.CoUninitialize()
+    except Exception:
+        pass
+    # Limpiar _tmp con timestamp si quedó en disco (fallo antes del rename)
+    try:
+        if ruta_tmp.exists():
+            ruta_tmp.unlink()
     except Exception:
         pass
 

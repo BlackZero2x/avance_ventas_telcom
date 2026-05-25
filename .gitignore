@@ -13,9 +13,25 @@ whatsapp_server/logs/
 # Node
 whatsapp_server/node_modules/
 
-# Excel output
+# Excel output y datos locales
 Archivos_Avance/
 temp/
+files/
+versiones/
+*.xlsx
+*.csv
+cuotas*.xlsx
+altas_historico.xlsx
+
+# Runtime / estado
+execution_log.json
+processed_emails.txt
+watchdog.log_*.txt
+whatsapp_server/.node-persist/
+
+# Claude Code
+.claude/
+.python-version
 
 # Python
 __pycache__/

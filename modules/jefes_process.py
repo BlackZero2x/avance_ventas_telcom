@@ -3,7 +3,7 @@ Proceso JEFES (Jefe de proyecto + Jefes de zona + Gerente comercial):
 Fuente: archivo AVANCE_{fecha}.xlsx generado por AVANCE.py
 
 1. Captura TDS!B4:V15  → imagen → grupo con mensaje + menciones
-2. Captura TDS!Y4:AT16 → imagen → grupo con mensaje + menciones
+2. Captura TDS!Y4:AT17 → imagen → grupo con mensaje + menciones
 3. Enviar SEGUIMIENTO_VDD_FIJA_dd-mm-aaaa.xlsx como adjunto con mensaje + menciones
 """
 import logging
@@ -60,6 +60,66 @@ class JefesProcess:
         )
         return None
 
+    def _capturar_rango(self, app, wb, sheet, rango, cap_path, excel_hwnd):
+        """Exporta un rango de Excel como PNG. Intenta CopyPicture+clipboard primero;
+        si falla (sesiones sin escritorio interactivo), usa el método Chart como fallback."""
+
+        # — Intento 1: CopyPicture → clipboard —
+        for intento in range(3):
+            try:
+                excel_hwnd = self._get_excel_hwnd() or excel_hwnd
+                if excel_hwnd:
+                    try:
+                        win32gui.ShowWindow(excel_hwnd, 9)
+                        win32gui.SetForegroundWindow(excel_hwnd)
+                    except Exception:
+                        pass
+                sheet.range(rango).api.Select()
+                app.api.ActiveWindow.ScrollIntoView(
+                    sheet.range(rango).left,
+                    sheet.range(rango).top,
+                    sheet.range(rango).width,
+                    sheet.range(rango).height,
+                )
+                time.sleep(1 + intento)
+                sheet.range(rango).api.CopyPicture(Appearance=1, Format=2)
+                time.sleep(2)
+                img = ImageGrab.grabclipboard()
+                if img:
+                    img.save(cap_path, "PNG")
+                    logging.info(f"  Guardada (CopyPicture): {cap_path}")
+                    return True
+            except Exception as e:
+                logging.warning(f"  CopyPicture intento {intento+1} fallido: {e}")
+                time.sleep(2)
+
+        # — Intento 2: Chart export (funciona sin escritorio interactivo) —
+        logging.info(f"  CopyPicture agotado — usando Chart export para {rango}...")
+        try:
+            xl_range = sheet.range(rango)
+            xl_range.api.Copy()
+            time.sleep(1)
+
+            # Crear un chart temporal en la misma hoja y pegarle la imagen del rango
+            charts = sheet.api.ChartObjects()
+            chart_obj = charts.Add(0, 0, xl_range.width, xl_range.height)
+            chart = chart_obj.Chart
+            chart.Paste()
+            time.sleep(1)
+
+            # Exportar el chart como PNG
+            chart.Export(os.path.normpath(cap_path))
+            chart_obj.Delete()
+            time.sleep(0.5)
+
+            if os.path.exists(cap_path):
+                logging.info(f"  Guardada (Chart export): {cap_path}")
+                return True
+        except Exception as e:
+            logging.error(f"  Chart export fallido para {rango}: {e}")
+
+        return False
+
     def _enviar_capturas(self, archivo, temp_dir, grupo):
         app = None
         wb = None
@@ -113,51 +173,24 @@ class JefesProcess:
 
             msg_captura1 = pick_variant(self.config.get("jefes_mensaje_captura1_variants"), self.config["jefes_mensaje_captura1"])
             msg_captura2 = pick_variant(self.config.get("jefes_mensaje_captura2_variants"), self.config["jefes_mensaje_captura2"])
+            menciones = self.config.get("jefes_menciones") or []
 
-            for rango, cap_path, caption in [
+            for rango, cap_path, msg in [
                 (self.config["jefes_tds_rango1"], os.path.join(temp_dir, "captura_tds_1.png"), msg_captura1),
                 (self.config["jefes_tds_rango2"], os.path.join(temp_dir, "captura_tds_2.png"), msg_captura2),
             ]:
                 logging.info(f"  Capturando TDS!{rango}...")
-                # Actualizar handle y asegurar foco antes de CopyPicture
-                excel_hwnd = self._get_excel_hwnd() or excel_hwnd
-                if excel_hwnd:
-                    try:
-                        win32gui.ShowWindow(excel_hwnd, 9)
-                        win32gui.SetForegroundWindow(excel_hwnd)
-                        time.sleep(0.5)
-                    except Exception:
-                        pass
-                # Scroll al rango para que sea visible antes de CopyPicture
-                sheet.range(rango).api.Select()
-                app.api.ActiveWindow.ScrollIntoView(
-                    sheet.range(rango).left,
-                    sheet.range(rango).top,
-                    sheet.range(rango).width,
-                    sheet.range(rango).height,
-                )
-                time.sleep(1)
-                sheet.range(rango).api.CopyPicture(Appearance=1, Format=2)
-                time.sleep(3)
-
-                capturado = False
-                for intento in range(8):
-                    try:
-                        img = ImageGrab.grabclipboard()
-                        if img:
-                            img.save(cap_path, "PNG")
-                            logging.info(f"  Guardada: {cap_path}")
-                            self.wa.send_image(grupo, cap_path, caption=caption)
-                            time.sleep(12)
-                            capturado = True
-                            break
-                        else:
-                            time.sleep(2)
-                    except Exception as e:
-                        logging.warning(f"  Intento {intento+1} grabclipboard: {e}")
-                        time.sleep(2)
-
-                if not capturado:
+                if self._capturar_rango(app, wb, sheet, rango, cap_path, excel_hwnd):
+                    # Enviar imagen primero (sin caption para no mezclar texto con menciones)
+                    self.wa.send_image(grupo, cap_path, caption="")
+                    time.sleep(5)
+                    # Enviar texto como mención real para que WhatsApp lo renderice correctamente
+                    if menciones:
+                        self.wa.send_mention(grupo, msg, menciones)
+                    else:
+                        self.wa.send_text(grupo, msg)
+                    time.sleep(12)
+                else:
                     logging.error(f"  No se pudo capturar TDS!{rango}")
 
             return True
@@ -182,12 +215,21 @@ class JefesProcess:
     def _enviar_seguimiento(self, grupo, menciones):
         try:
             archivos_dir = self.config["archivos_avance_dir"]
-            archivos = sorted(glob.glob(os.path.join(archivos_dir, "SEGUIMIENTO_VDD_FIJA_*.xlsx")), reverse=True)
-            if not archivos:
+            candidatos = glob.glob(os.path.join(archivos_dir, "SEGUIMIENTO_VDD_FIJA_*.xlsx"))
+            if not candidatos:
                 logging.error(f"No se encontro SEGUIMIENTO_VDD_FIJA en: {archivos_dir}")
                 return False
 
-            archivo = archivos[0]
+            def _fecha_desde_nombre(path):
+                nombre = os.path.basename(path)
+                # Formato: SEGUIMIENTO_VDD_FIJA_dd-mm-yyyy.xlsx
+                partes = nombre.replace("SEGUIMIENTO_VDD_FIJA_", "").replace(".xlsx", "").split("-")
+                try:
+                    return datetime(int(partes[2]), int(partes[1]), int(partes[0]))
+                except Exception:
+                    return datetime.min
+
+            archivo = max(candidatos, key=_fecha_desde_nombre)
             logging.info(f"  Enviando SEGUIMIENTO: {os.path.basename(archivo)}")
 
             msg_seg = pick_variant(self.config.get("jefes_mensaje_seguimiento_variants"), self.config["jefes_mensaje_seguimiento"])

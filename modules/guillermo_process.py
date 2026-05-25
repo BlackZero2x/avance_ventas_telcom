@@ -13,6 +13,9 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "shared"))
 from gmail_helper import GmailHelper
 from msg_utils import pick_variant
+from dotenv import load_dotenv
+
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 
 class GuillermnoProcess:
@@ -52,6 +55,10 @@ class GuillermnoProcess:
         return True
 
     def _enviar_correo(self, archivo):
+        destinatario = os.environ.get("GUILLERMO_EMAIL", "").strip()
+        if not destinatario:
+            logging.error("GUILLERMO_EMAIL no definido en .env — correo no enviado")
+            return False
         ayer = (datetime.now() - timedelta(days=1)).strftime("%d-%m-%Y")
         asunto = f"Avance de FIJA actualizado al {ayer}"
         cuerpo = (
@@ -59,7 +66,6 @@ class GuillermnoProcess:
             f"Adjunto el reporte de avance de ventas FIJA actualizado al {ayer}.\n\n"
             f"Saludos."
         )
-        destinatario = self.config.get("guillermo_email", "")
         logging.info(f"Enviando correo a: {destinatario}")
         return self.gmail.send_email_with_attachment(
             [destinatario], asunto, cuerpo, archivo
