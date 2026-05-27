@@ -12,9 +12,18 @@ set WA_CLIENT=C:\proyectos\AVANCE_MOVISTAR\whatsapp_server\wa_client.py
 set LOG_FILE=C:\proyectos\AVANCE_MOVISTAR\logs\wa_server_start.log
 set MY_NUMBER=51975155264@c.us
 
-echo [%date% %time%] Reiniciando servidor WhatsApp (inicio de dia)... >> "%LOG_FILE%"
+echo [%date% %time%] Verificando servidor WhatsApp... >> "%LOG_FILE%"
 
-:: Siempre matar node y chromium para arrancar fresco — evita sesiones caducadas o memoria acumulada
+:: Si el servidor ya responde al health check, no hace falta reiniciar
+"%PYTHON_EXE%" "%WA_CLIENT%" --health >NUL 2>&1
+if %ERRORLEVEL% EQU 0 (
+    echo [%date% %time%] Servidor ya activo — no se reinicia. >> "%LOG_FILE%"
+    call :enviar_confirmacion
+    goto :fin
+)
+
+:: El servidor no responde: matar node y chromium y arrancar fresco
+echo [%date% %time%] Servidor no responde — reiniciando... >> "%LOG_FILE%"
 taskkill /F /IM node.exe >NUL 2>&1
 taskkill /F /IM chrome.exe >NUL 2>&1
 ping 127.0.0.1 -n 4 >NUL
@@ -45,7 +54,7 @@ ping 127.0.0.1 -n 6 >NUL
 "%PYTHON_EXE%" "%WA_CLIENT%" --health >NUL 2>&1
 if %ERRORLEVEL% NEQ 0 goto :esperar
 
-echo [%date% %time%] Servidor WhatsApp recuperado tras %intentos% intentos. >> "%LOG_FILE%"
+echo [%date% %time%] Servidor iniciado tras %intentos% intentos. >> "%LOG_FILE%"
 call :enviar_confirmacion
 
 :fin

@@ -13,6 +13,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "shared"))
 from gmail_helper import GmailHelper
 from msg_utils import pick_variant
+from execution_log import registrar_canal, canal_ok
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
@@ -46,12 +47,16 @@ class GuillermnoProcess:
         return ok_wa and ok_mail
 
     def _enviar_whatsapp(self, archivo):
+        if canal_ok("guillermo", "wa"):
+            logging.info("WhatsApp Guillermo ya enviado hoy — omitiendo reenvio")
+            return True
         caption = pick_variant(
             self.config.get("guillermo_message_variants"),
             self.config["guillermo_message"]
         )
         logging.info(f"Enviando archivo a Guillermo (WA): {os.path.basename(archivo)}")
         self.wa.send_file(self.config["guillermo_wa_contact"], archivo, caption=caption)
+        registrar_canal("guillermo", "wa", True)
         return True
 
     def _enviar_correo(self, archivo):
@@ -66,10 +71,16 @@ class GuillermnoProcess:
             f"Adjunto el reporte de avance de ventas FIJA actualizado al {ayer}.\n\n"
             f"Saludos."
         )
+        if canal_ok("guillermo", "email"):
+            logging.info("Correo Guillermo ya enviado hoy — omitiendo reenvio")
+            return True
         logging.info(f"Enviando correo a: {destinatario}")
-        return self.gmail.send_email_with_attachment(
+        ok = self.gmail.send_email_with_attachment(
             [destinatario], asunto, cuerpo, archivo
         )
+        if ok:
+            registrar_canal("guillermo", "email", True)
+        return ok
 
     def _buscar_avance(self):
         directorio = self.config["archivos_avance_dir"]

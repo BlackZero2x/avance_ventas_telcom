@@ -14,6 +14,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "shared"))
 from gmail_helper import GmailHelper
 from msg_utils import pick_variant
+from execution_log import registrar_canal, canal_ok
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
@@ -57,6 +58,9 @@ class CarlosProcess:
             return True
 
         try:
+            if canal_ok("carlos", "wa"):
+                logging.info("  WhatsApp Carlos ya enviado hoy — omitiendo reenvio")
+                return True
             caption = pick_variant(
                 self.config.get("carlos_message_variants"),
                 self.config.get("carlos_message", "Buen dia Carlos, adjunto el avance actualizado.")
@@ -65,6 +69,7 @@ class CarlosProcess:
             self.wa.send_file(contacto, archivo_avance, caption=caption)
 
             self._enviar_seguimiento_wa(contacto)
+            registrar_canal("carlos", "wa", True)
             return True
         except Exception as e:
             logging.error(f"  Error enviando a Carlos por WA: {e}")
@@ -102,6 +107,9 @@ class CarlosProcess:
         if not destinatario:
             logging.error("CARLOS_EMAIL no definido en .env — correo no enviado")
             return False
+        if canal_ok("carlos", "email"):
+            logging.info("  Correo Carlos ya enviado hoy — omitiendo reenvio")
+            return True
         logging.info(f"  Enviando correo a: {destinatario}")
         logging.info(f"  Adjunto: {os.path.basename(archivo)}")
         ok = self.gmail.send_email_with_attachment(
@@ -109,6 +117,7 @@ class CarlosProcess:
         )
         if ok:
             logging.info("  Correo Carlos enviado OK")
+            registrar_canal("carlos", "email", True)
         else:
             logging.error("  Error enviando correo Carlos")
         return ok

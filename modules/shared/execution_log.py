@@ -94,6 +94,21 @@ def registrar_modulo(nombre: str, ok: bool):
     _escribir(data)
 
 
+def registrar_canal(modulo: str, canal: str, ok: bool):
+    """Registra el resultado de un canal específico (ej. 'guillermo_wa', 'carlos_email')."""
+    data = _leer()
+    hoy  = _hoy()
+    data.setdefault(hoy, {}).setdefault("canales", {})
+    data[hoy]["canales"][f"{modulo}_{canal}"] = ok
+    _escribir(data)
+
+
+def canal_ok(modulo: str, canal: str) -> bool:
+    """Devuelve True si el canal ya fue enviado exitosamente hoy."""
+    estado = estado_hoy()
+    return estado.get("canales", {}).get(f"{modulo}_{canal}", False)
+
+
 def registrar_fin(ok: bool, motivo: str = None):
     data = _leer()
     hoy  = _hoy()
