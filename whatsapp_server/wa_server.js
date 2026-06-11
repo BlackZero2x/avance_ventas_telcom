@@ -4,6 +4,7 @@ const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
+const { execSync } = require("child_process");
 
 // ============================================================
 // CONFIGURACIÓN
@@ -123,9 +124,20 @@ async function _reiniciarCliente() {
   _reconectando = true;
   log("INFO", "Destruyendo cliente anterior...");
   try {
-    if (waClient) await waClient.destroy();
+    // Timeout de 15s para destroy — si Chrome está completamente bloqueado, no esperar indefinidamente
+    if (waClient) {
+      await Promise.race([
+        waClient.destroy(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("destroy timeout")), 15000)),
+      ]);
+    }
   } catch (e) {
     log("WARN", "Error al destruir cliente (ignorado)", { e: e.message });
+    // Force-kill cualquier proceso Chrome huerfano antes de reiniciar
+    try {
+      execSync("taskkill /F /IM chrome.exe /T 2>nul", { stdio: "ignore" });
+      log("INFO", "Procesos Chrome terminados forzosamente");
+    } catch (_) { /* ignorar si no hay Chrome */ }
   }
   waClient = null;
   isReady  = false;
@@ -134,16 +146,44 @@ async function _reiniciarCliente() {
   startWhatsApp();
 }
 
+// Watchdog: cada 5 minutos verifica que Chrome siga vivo haciendo un ping real
+// Si detecta que el frame está caído, reinicia antes de que llegue un envío real
+setInterval(async () => {
+  if (!isReady || _reconectando) return;
+  try {
+    await waClient.pupPage.evaluate(() => true);
+  } catch (e) {
+    if (_isDetachedFrame(e)) {
+      log("ERROR", "Watchdog: Chrome caido (detached Frame) — reiniciando cliente");
+      isReady = false;
+      _reiniciarCliente();
+    }
+  }
+}, 5 * 60 * 1000);
+
 // ============================================================
 // COLA DE ENVÍO — mínimo 5 s entre mensajes salientes
 // ============================================================
 const SEND_DELAY_MS = 5000;
 let sendQueue = Promise.resolve();
 
+function _isDetachedFrame(err) {
+  return err && err.message && err.message.includes("detached Frame");
+}
+
 function enqueue(fn) {
-  sendQueue = sendQueue.then(() => fn()).then(
-    (result) => new Promise((res) => setTimeout(() => res(result), SEND_DELAY_MS)),
-    (err)    => new Promise((_, rej) => setTimeout(() => rej(err), SEND_DELAY_MS))
+  sendQueue = sendQueue.then(
+    () => fn().then(
+      (result) => new Promise((res) => setTimeout(() => res(result), SEND_DELAY_MS)),
+      (err) => new Promise((_, rej) => {
+        if (_isDetachedFrame(err)) {
+          log("ERROR", "Chrome desconectado (detached Frame) — reiniciando cliente en 5s");
+          isReady = false;
+          setTimeout(() => _reiniciarCliente(), 5000);
+        }
+        setTimeout(() => rej(err), SEND_DELAY_MS);
+      })
+    )
   );
   return sendQueue;
 }
@@ -265,28 +305,23 @@ app.post("/send-mention", async (req, res) => {
   const chatId = resolveRecipient(to);
   if (!chatId) return res.status(404).json({ error: `Destinatario "${to}" no encontrado en config` });
   try {
-    // whatsapp-web.js requiere objetos Contact, no strings, para renderizar menciones
     const mentionIds = mentions || [];
-    const mentionContacts = await Promise.all(
-      mentionIds.map(async (id) => {
-        try {
-          return await waClient.getContactById(id);
-        } catch (_e) {
-          // Contacto no guardado en agenda — construir objeto mínimo compatible
-          // con whatsapp-web.js para que la mención se renderice igualmente
-          log("WARN", `Contacto no en agenda, usando fallback para: ${id}`);
-          return { id: { _serialized: id, user: id.split("@")[0], server: "c.us" }, _serialized: id };
-        }
-      })
-    );
-    const resolvedMentions = mentionContacts.filter(Boolean);
-    const result = await enqueue(() =>
-      waClient.sendMessage(chatId, message, { mentions: resolvedMentions })
-    );
+    log("INFO", "Intentando enviar menciones", { to, chatId, mentionIds });
+
+    let result;
+    try {
+      result = await enqueue(() =>
+        waClient.sendMessage(chatId, message, { mentions: mentionIds })
+      );
+    } catch (mentionErr) {
+      // Si falla con menciones, enviar como texto plano sin ellas
+      log("WARN", "Menciones fallaron, enviando sin ellas", { to, error: mentionErr.message });
+      result = await enqueue(() => waClient.sendMessage(chatId, message));
+    }
     log("INFO", "Mensaje con menciones enviado", { to, chatId, menciones: mentionIds.length });
     res.json({ success: true, messageId: result.id._serialized });
   } catch (err) {
-    log("ERROR", "Error al enviar menciones", { to, error: err.message });
+    log("ERROR", "Error al enviar menciones", { to, error: err.message, stack: err.stack });
     res.status(500).json({ error: err.message });
   }
 });
