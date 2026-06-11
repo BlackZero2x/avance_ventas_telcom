@@ -78,8 +78,8 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-sys.path.insert(0, str(Path(__file__).parent / "whatsapp_server"))
-sys.path.insert(0, str(Path(__file__).parent / "modules"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "whatsapp_server"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "modules"))
 
 from wa_client import WhatsAppClient
 
@@ -98,8 +98,8 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
-BASE_DIR = Path(__file__).parent
-CONFIG_PATH = BASE_DIR / "config.json"
+BASE_DIR = Path(__file__).parent.parent  # raíz del proyecto
+CONFIG_PATH = BASE_DIR / "whatsapp_server" / "config.json"
 TOKEN_PATH = BASE_DIR / "token.json"
 CREDS_PATH = BASE_DIR / "credentials.json"
 LOGS_DIR = BASE_DIR / "logs"
