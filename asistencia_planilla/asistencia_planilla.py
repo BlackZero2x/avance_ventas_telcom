@@ -235,6 +235,52 @@ def _detectar_columna(df: pd.DataFrame, candidatos: list) -> str | None:
     return None
 
 
+def calcular_ausentes(df_rh: pd.DataFrame, df_asistencia: pd.DataFrame) -> str:
+    """Retorna lista de ausentes organizada por ZONAL → SUPERVISOR → VENDEDOR."""
+    dnis_asistentes = set(df_asistencia["DNI"].dropna().astype(int).tolist()) if not df_asistencia.empty else set()
+
+    df = df_rh.copy()
+    df["ASISTIO"] = df["DNI"].apply(
+        lambda d: 1 if pd.notna(d) and int(d) in dnis_asistentes else 0
+    )
+
+    col_zonal = _detectar_columna(df, ["ZONAL", "ZONA", "REGION"])
+    col_sup = _detectar_columna(df, ["SUPERVISOR", "SUP", "JEFE"])
+    col_vend = _detectar_columna(df, ["VENDEDOR", "NOMBRE", "PERSON"])
+
+    if not col_zonal or not col_vend:
+        logging.warning("No se pudo detectar columnas para lista de ausentes")
+        return ""
+
+    ausentes = df[df["ASISTIO"] == 0]
+    if ausentes.empty:
+        return "✅ *Todos asistieron hoy*"
+
+    lineas = ["⚠️ *Vendedores sin registro de asistencia:*", ""]
+    zonal_actual = None
+    sup_actual = None
+
+    for _, row in ausentes.sort_values([col_zonal] + ([col_sup] if col_sup else [])).iterrows():
+        zonal = row[col_zonal]
+        sup = row[col_sup] if col_sup else None
+        vend = row[col_vend]
+
+        if zonal != zonal_actual:
+            if zonal_actual is not None:
+                lineas.append("")
+            lineas.append(f"*{zonal}*")
+            zonal_actual = zonal
+            sup_actual = None
+
+        if col_sup and sup != sup_actual:
+            lineas.append(f"  {sup}")
+            sup_actual = sup
+
+        lineas.append(f"    • {vend}")
+
+    return "\n".join(lineas)
+
+
 def calcular_tablas(df_rh: pd.DataFrame, df_asistencia: pd.DataFrame):
     """Retorna (df_por_zonal, df_por_supervisor)."""
     dnis_asistentes = set(df_asistencia["DNI"].dropna().astype(int).tolist()) if not df_asistencia.empty else set()
@@ -580,10 +626,19 @@ def main():
     wa      = WhatsAppClient()
     caption = _construir_caption(df_zonal, fecha_hoy)
 
-    # IDs de menciones desde config.json (mismo patrón que jefes_process)
+    # IDs de menciones: leer desde contacts del config
     _cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    menciones_ids   = _cfg.get("asistencia_menciones", [])
-    texto_menciones = caption + "\n@Jesús Ascencios @Carlos P"
+    _contacts = _cfg.get("contacts", {})
+    menciones_ids = [
+        _contacts[k]
+        for k in ("Jesús Ascencios", "Carlos P")
+        if k in _contacts
+    ]
+    # El texto debe tener @número (sin @c.us), no @nombre — así WhatsApp renderiza la mención real
+    partes_mencion = " ".join(
+        f"@{wa_id.replace('@c.us', '')}" for wa_id in menciones_ids
+    )
+    texto_menciones = caption + "\n" + partes_mencion
 
     logging.info(f"Enviando informe a: {destino}")
     if ok_zonal:
@@ -600,6 +655,13 @@ def main():
             wa.send_image(destino, png_sup, caption="")
         else:
             logging.warning("Sin imagen de supervisores.")
+
+    # 5. Enviar lista de ausentes
+    time.sleep(5)
+    texto_ausentes = calcular_ausentes(df_rh, df_asistencia)
+    if texto_ausentes:
+        wa.send_text(destino, texto_ausentes)
+        logging.info("Lista de ausentes enviada.")
 
     # Limpiar temporales
     for f in [png_zonal, png_sup]:
