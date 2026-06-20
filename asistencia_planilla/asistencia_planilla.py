@@ -273,7 +273,7 @@ def calcular_ausentes(df_rh: pd.DataFrame, df_asistencia: pd.DataFrame) -> str:
             sup_actual = None
 
         if col_sup and sup != sup_actual:
-            lineas.append(f"  {sup}")
+            lineas.append(f"  _{sup}_")
             sup_actual = sup
 
         lineas.append(f"    • {vend}")
