@@ -82,6 +82,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "whatsapp_server"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "modules"))
 
 from wa_client import WhatsAppClient
+from shared.screenshot_safe import ScreenshotManager
 
 
 # ── Constantes ────────────────────────────────────────────────────────────────
@@ -99,19 +100,27 @@ SCOPES = [
 ]
 
 BASE_DIR = Path(__file__).parent.parent  # raíz del proyecto
+SUBDIR   = Path(__file__).parent         # cortes_ventas/
 CONFIG_PATH = BASE_DIR / "whatsapp_server" / "config.json"
 TOKEN_PATH = BASE_DIR / "token.json"
 CREDS_PATH = BASE_DIR / "credentials.json"
 LOGS_DIR = BASE_DIR / "logs"
-TEMP_DIR = BASE_DIR / "temp"
+TEMP_DIR = SUBDIR / "temp"              # Excel e imágenes temporales en cortes_ventas/temp/
 
 # ID del Google Sheet de cortes (hoja Respuestas + hoja CUOTAS)
 SHEET_ID = os.environ.get("CORTES_SHEET_ID", "1yrzxBxuwUsB0qNyjnpc5AbkQlojPkU4dS4zm1XftSt8")
+
+# ID del Google Sheet de VENTORY (hoja de ventas registradas)
+VENTORY_SHEET_ID = os.environ.get("SHEET_ID_VENTORY", "1EGNnQYG51MROVf2tuxKmEqCkw9lfIXQqJBkJke3AITk")
+VENTORY_HOJA_VENTAS = "REG_VTAS_BO"  # nombre de la hoja con datos de ventas registradas (gid=1543273197)
 
 # Nombres de grupos en config.json
 GRUPO_VPA = "⚡⚡VPA - Auren"
 GRUPO_SUPERVISORES = "Canal Fija 2026 Supervisores y Jefes"
 GRUPO_GESTION = "Canal Fija 2026 Gestión AUREN"
+
+# ID de Carlos Parra en WA — recibe mención cuando supervisores no reportan a tiempo
+CARLOS_WA_ID = "51968035020@c.us"
 
 # Colores para el Excel de imagen (RGB como tuplas)
 COLOR_HEADER = (17, 138, 178)      # #118AB2 azul cielo
@@ -139,14 +148,17 @@ REGIONES = {
 LOGS_DIR.mkdir(exist_ok=True)
 TEMP_DIR.mkdir(exist_ok=True)
 
+# Log local en cortes_ventas/logs/ (además del log central en logs/)
+LOCAL_LOGS_DIR = Path(__file__).parent / "logs"
+LOCAL_LOGS_DIR.mkdir(exist_ok=True)
+
+_log_fecha = datetime.now().strftime('%Y%m%d')
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler(
-            LOGS_DIR / f"cortes_{datetime.now().strftime('%Y%m%d')}.log",
-            encoding="utf-8"
-        ),
+        logging.FileHandler(LOGS_DIR / f"cortes_{_log_fecha}.log", encoding="utf-8"),
+        logging.FileHandler(LOCAL_LOGS_DIR / f"cortes_{_log_fecha}.log", encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -200,6 +212,106 @@ def _leer_hoja(service, nombre_hoja):
     # Normalizar filas con distinta longitud
     filas_norm = [fila + [""] * (len(encabezados) - len(fila)) for fila in filas]
     return pd.DataFrame(filas_norm, columns=encabezados)
+
+
+def _normalizar_nombre_sup(nombre: str) -> str:
+    """Normaliza nombres de supervisores para matching: mayúsculas, sin espacios extra, sin acentos."""
+    import unicodedata
+    # Remover acentos
+    nombre_sin_acentos = ''.join(
+        c for c in unicodedata.normalize('NFD', nombre)
+        if unicodedata.category(c) != 'Mn'
+    )
+    return nombre_sin_acentos.strip().upper()
+
+
+def _leer_ventory_ventas(service, fecha_hoy: date) -> dict:
+    """
+    Lee la hoja de ventas registradas de VENTORY (gid=1543273197).
+    Retorna un dict {supervisor: contador_acumulado_hasta_ahora}
+
+    Filtros:
+    - DAY = "HOY" (o fecha_hoy en formato DD/MM/YYYY)
+    - Vta_Hoy = "Si"
+    - Extrae la hora del campo HORA (formato "hh")
+    - Solo cuenta hasta la hora actual del día
+    """
+    try:
+        logging.info(f"Leyendo hoja '{VENTORY_HOJA_VENTAS}' de VENTORY...")
+        resultado = service.spreadsheets().values().get(
+            spreadsheetId=VENTORY_SHEET_ID,
+            range=VENTORY_HOJA_VENTAS,
+        ).execute()
+        valores = resultado.get("values", [])
+        if not valores or len(valores) < 2:
+            logging.warning(f"Hoja '{VENTORY_HOJA_VENTAS}' en VENTORY vacia o no encontrada")
+            return {}
+
+        encabezados = valores[0]
+        filas = valores[1:]
+        # Normalizar: rellenar con "" si faltan columnas, truncar si sobran
+        max_cols = len(encabezados)
+        filas_norm = []
+        for fila in filas:
+            if len(fila) < max_cols:
+                fila_norm = fila + [""] * (max_cols - len(fila))
+            else:
+                fila_norm = fila[:max_cols]
+            filas_norm.append(fila_norm)
+        df = pd.DataFrame(filas_norm, columns=encabezados)
+
+        if df.empty:
+            return {}
+
+        # Buscar índices de columnas clave
+        idx_day = next((i for i, col in enumerate(encabezados) if col.upper() == "DAY"), -1)
+        idx_sup = next((i for i, col in enumerate(encabezados) if col.upper() == "SUP"), -1)
+        idx_hora = next((i for i, col in enumerate(encabezados) if col.upper() == "HORA"), -1)
+        idx_vta_hoy = next((i for i, col in enumerate(encabezados) if col.upper() == "VTA_HOY"), -1)
+
+        if idx_day < 0 or idx_sup < 0 or idx_hora < 0 or idx_vta_hoy < 0:
+            logging.warning(f"Columnas requeridas no encontradas en VENTORY: DAY={idx_day}, SUP={idx_sup}, HORA={idx_hora}, VTA_HOY={idx_vta_hoy}")
+            logging.info(f"Encabezados disponibles: {encabezados}")
+            return {}
+
+        # Normalizar fecha a dos formatos para comparación (01/04/2026 y 1/04/2026)
+        fecha_formato1 = fecha_hoy.strftime("%d/%m/%Y")  # 22/07/2026
+        fecha_formato2 = f"{fecha_hoy.day}/{fecha_hoy.month}/{fecha_hoy.year}"  # 22/7/2026 (sin ceros a la izquierda)
+
+        contador = {}
+
+        logging.info(f"Procesando {len(df)} filas de VENTORY. Buscando DAY='{fecha_formato1}' o '{fecha_formato2}', Vta_Hoy='Sí'")
+
+        for _, fila in df.iterrows():
+            day = str(fila.iloc[idx_day]).strip() if idx_day >= 0 else ""
+            sup = str(fila.iloc[idx_sup]).strip() if idx_sup >= 0 else ""
+            vta_hoy = str(fila.iloc[idx_vta_hoy]).strip() if idx_vta_hoy >= 0 else ""
+
+            # Filtrar por fecha (DAY puede ser "22/07/2026" o "22/7/2026")
+            if day != fecha_formato1 and day != fecha_formato2:
+                continue
+
+            # Filtrar por Vta_Hoy = "Sí" (con tilde, como aparece en VENTORY)
+            if vta_hoy != "Sí":
+                continue
+
+            if not sup or sup == "0":
+                continue
+
+            # Contar TODAS las ventas del día (sin filtro de hora)
+            # Normalizar nombre para matching con tabla de supervisores
+            sup_norm = _normalizar_nombre_sup(sup)
+            contador[sup] = contador.get(sup, 0) + 1
+
+        logging.info(f"Ventas registradas en VENTORY cargadas (total del día): {len(contador)} supervisores con ventas")
+        if contador:
+            logging.info(f"Detalle por supervisor (VENTORY): {contador}")
+            logging.info(f"Nombres en VENTORY: {list(contador.keys())}")
+        return contador
+
+    except Exception as e:
+        logging.error(f"Error leyendo VENTORY ventas: {e}")
+        return {}
 
 
 def cargar_datos(service, corte: str, fecha_hoy: date) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -336,17 +448,56 @@ def calcular_tabla_zonal(
     return df_tabla
 
 
+def _mapear_supervisores(df: pd.DataFrame, mapeo: dict) -> pd.DataFrame:
+    """Reemplaza nombres de supervisores según mapeo (ej: GOMEZ PALZA → SUPERVISOR MOQUEGUA)."""
+    if df.empty or not mapeo:
+        return df
+    df = df.copy()
+    # Aplicar mapeo a todos los posibles campos de supervisor
+    for col in ["SUP", "SUPERVISOR"]:
+        if col in df.columns:
+            df[col] = df[col].apply(lambda x: mapeo.get(_normalizar_nombre_sup(x), x) if pd.notna(x) else x)
+    return df
+
+
 def calcular_tabla_supervisor(
     df_todos: pd.DataFrame,
     df_cuotas: pd.DataFrame,
     corte_actual: str,
     fecha_hoy: date,
+    service=None,
 ) -> pd.DataFrame:
     """
     Construye la tabla resumen por SUPERVISOR con columnas:
-    ZONAL, SUP, 12PM, 2PM, 4PM, 6PM, CIERRE, CUOTA, %ALCANCE, PROYECTADO
+    ZONAL, SUP, 12PM, 2PM, 4PM, 6PM, CIERRE, CUOTA, %ALCANCE, PROYECTADO, VENTORY
+
+    Si se pasa `service` (cliente de Google Sheets), carga de VENTORY el contador acumulado
+    de ventas registradas hasta la hora actual (filtros: DAY=HOY, Vta_Hoy=Si).
     """
+    # Mapeo de supervisores antiguos a nuevos nombres
+    MAPEO_SUPERVISORES = {
+        _normalizar_nombre_sup("GOMEZ PALZA CAROLINA MERCEDES"): "SUPERVISOR MOQUEGUA",
+    }
+
+    # Aplicar mapeo a los DataFrames de entrada
+    df_todos = _mapear_supervisores(df_todos, MAPEO_SUPERVISORES)
+    df_cuotas = _mapear_supervisores(df_cuotas, MAPEO_SUPERVISORES)
+
     cuotas_sup = _cuotas_por_supervisor(df_cuotas)
+
+    # Mapeo de supervisores antiguos a nuevos nombres
+    MAPEO_SUPERVISORES = {
+        _normalizar_nombre_sup("GOMEZ PALZA CAROLINA MERCEDES"): "SUPERVISOR MOQUEGUA",
+    }
+
+    # Cargar contador de ventas registradas en VENTORY (acumulado hasta ahora)
+    ventory_ventas = {}
+    if service:
+        ventory_ventas_raw = _leer_ventory_ventas(service, fecha_hoy)
+        # Aplicar mapeo a nombres de supervisores en VENTORY
+        for nombre_orig, count in ventory_ventas_raw.items():
+            nombre_mapped = MAPEO_SUPERVISORES.get(_normalizar_nombre_sup(nombre_orig), nombre_orig)
+            ventory_ventas[nombre_mapped] = ventory_ventas.get(nombre_mapped, 0) + count
 
     df_dia = df_todos.copy() if not df_todos.empty else pd.DataFrame(
         columns=["ZONAL", "SUP", "CORTE", "VENTA_TOTAL", "FECHA_CORTE_DT"]
@@ -357,31 +508,71 @@ def calcular_tabla_supervisor(
     else:
         pivot = pd.DataFrame()
 
-    # Recoger todos los supervisores (del Sheet y de CUOTAS)
-    sups_sheet = set()
+    # Recoger todos los supervisores (por key único, normalizando mayúsculas)
+    # Crear dict {supervisor_norm: (supervisor_original, lista_de_zonales, zonal_de_cuotas)} para evitar duplicados
+    sups_dict = {}  # {supervisor_norm_upper: (supervisor_original, [zonal1, zonal2, ...], zonal_cuotas)}
+
     if not pivot.empty:
         for zonal, sup in pivot.index:
-            sups_sheet.add((zonal, sup))
+            sup_norm = _normalizar_nombre_sup(sup)
+            if sup_norm not in sups_dict:
+                sups_dict[sup_norm] = (sup, [], None)
+            zonales_list, zonal_cuotas = sups_dict[sup_norm][1], sups_dict[sup_norm][2]
+            if zonal not in zonales_list:
+                zonales_list.append(zonal)
+            sups_dict[sup_norm] = (sup, zonales_list, zonal_cuotas)
 
-    sups_cuotas = set()
+    # Agregar supervisores de CUOTAS (y guardar su zonal)
     if not df_cuotas.empty:
         for _, fila in df_cuotas.iterrows():
-            z = str(fila.get("ZONAL", "")).strip()
             s = str(fila.get("SUPERVISOR", "")).strip()
-            if z and s:
-                sups_cuotas.add((z, s))
+            z = str(fila.get("ZONAL", "")).strip()
+            if s:
+                s_norm = _normalizar_nombre_sup(s)
+                if s_norm not in sups_dict:
+                    sups_dict[s_norm] = (s, [], z)
+                else:
+                    # Actualizar zonal de CUOTAS si existe
+                    sup_original, zonales_list, _ = sups_dict[s_norm]
+                    sups_dict[s_norm] = (sup_original, zonales_list, z)
 
-    todos_sups = sorted(sups_sheet | sups_cuotas)
+    # Agregar supervisores de VENTORY
+    for sup_ventory in ventory_ventas.keys():
+        sup_norm = _normalizar_nombre_sup(sup_ventory)
+        if sup_norm not in sups_dict:
+            sups_dict[sup_norm] = (sup_ventory, [], None)
+
+    # Construir lista de (zonal_principal, sup, sup_norm) y ordenar por ZONAL primero, luego por SUP
+    sups_con_zonal = []
+    for sup_norm, (sup_original, zonales_list, zonal_cuotas) in sups_dict.items():
+        # Prioridad: zonales de cortes horarios, luego zonal de CUOTAS, luego SIN ZONAL
+        if zonales_list:
+            zonal_principal = zonales_list[0]
+        elif zonal_cuotas:
+            zonal_principal = zonal_cuotas
+        else:
+            zonal_principal = "SIN ZONAL"
+        sups_con_zonal.append((zonal_principal, sup_original, sup_norm))
+
+    # Ordenar por ZONAL (alfabético), luego por SUP (alfabético)
+    sups_con_zonal_sorted = sorted(sups_con_zonal, key=lambda x: (x[0].upper(), x[1].upper()))
+
+    logging.info(f"Supervisores únicos encontrados: {len(sups_con_zonal_sorted)}")
+    for i, (zonal, sup, _) in enumerate(sups_con_zonal_sorted):
+        logging.info(f"  {i+1}. {zonal} | {sup}")
 
     filas = []
-    for zonal, sup in todos_sups:
-        fila = {"ZONAL": zonal, "SUP": sup}
+    for zonal_principal, sup, sup_norm in sups_con_zonal_sorted:
+        fila = {"ZONAL": zonal_principal, "SUP": sup}
+
+        # Sumar TODOS los cortes de este supervisor en TODAS las zonales
         for h in HORAS:
-            fila[h] = (
-                int(pivot.loc[(zonal, sup), h])
-                if (not pivot.empty and (zonal, sup) in pivot.index and h in pivot.columns)
-                else 0
-            )
+            suma_h = 0
+            if not pivot.empty:
+                for zonal, sup_pivot in pivot.index:
+                    if _normalizar_nombre_sup(sup_pivot) == sup_norm and h in pivot.columns:
+                        suma_h += int(pivot.loc[(zonal, sup_pivot), h])
+            fila[h] = suma_h
 
         suma_cortes = sum(fila[h] for h in HORAS)
         fila["AVANCE_DIA"] = suma_cortes
@@ -397,9 +588,23 @@ def calcular_tabla_supervisor(
         else:
             fila["PROYECTADO"] = int(suma_cortes)
 
+        # Agregar contador de ventas registradas en VENTORY
+        # Buscar coincidencia exacta primero, luego por coincidencia parcial (primeras palabras)
+        contador_ventory = ventory_ventas.get(sup, 0)
+        if contador_ventory == 0:
+            # Intentar matching aproximado: buscar si algún nombre de VENTORY contiene el nombre del supervisor
+            sup_norm = _normalizar_nombre_sup(sup)
+            for nombre_ventory, count in ventory_ventas.items():
+                nombre_ventory_norm = _normalizar_nombre_sup(nombre_ventory)
+                # Match si el nombre del supervisor está contenido en el de VENTORY o viceversa
+                if sup_norm in nombre_ventory_norm or nombre_ventory_norm in sup_norm:
+                    contador_ventory = count
+                    break
+        fila["VENTORY"] = contador_ventory
+
         filas.append(fila)
 
-    cols = ["ZONAL", "SUP"] + HORAS + ["AVANCE_DIA", "CUOTA", "%ALCANCE", "PROYECTADO"]
+    cols = ["ZONAL", "SUP"] + HORAS + ["AVANCE_DIA", "CUOTA", "%ALCANCE", "PROYECTADO", "VENTORY"]
     df_tabla = pd.DataFrame(filas, columns=cols)
 
     # Fila de totales
@@ -419,6 +624,7 @@ def calcular_tabla_supervisor(
         ))
     else:
         totales["PROYECTADO"] = int(totales["AVANCE_DIA"])
+    totales["VENTORY"] = int(df_tabla["VENTORY"].sum())
 
     df_tabla = pd.concat([df_tabla, pd.DataFrame([totales])], ignore_index=True)
     return df_tabla
@@ -512,9 +718,12 @@ def _color_alcance(valor_pct: float):
         return COLOR_ROJO
 
 
-def generar_imagen_tabla(df: pd.DataFrame, titulo: str, ruta_png: str) -> str | None:
+def generar_imagen_tabla(df: pd.DataFrame, titulo: str, ruta_png: str, wb_existente=None, nombre_hoja: str = "Tabla") -> tuple[str, str]:
     """
-    Genera un archivo Excel formateado y devuelve la ruta del xlsx temporal.
+    Genera una hoja Excel formateada dentro de un workbook existente o crea uno nuevo.
+
+    Retorna (ruta_xlsx, nombre_hoja_creada)
+
     Si df contiene la columna '_tipo' (valores: 'region'|'zonal'|'total'),
     aplica formato especial para las filas de región.
     La captura PNG se realiza en generar_imagenes_tablas() con una sola instancia de Excel.
@@ -527,15 +736,24 @@ def generar_imagen_tabla(df: pd.DataFrame, titulo: str, ruta_png: str) -> str | 
 
     ruta_xlsx = ruta_png.replace(".png", ".xlsx")
 
+    # Usar workbook existente o crear uno nuevo
+    if wb_existente is not None:
+        wb = wb_existente
+        # Crear una nueva hoja con el nombre especificado
+        if nombre_hoja in wb.sheetnames:
+            # Si ya existe, eliminarla
+            del wb[nombre_hoja]
+        ws = wb.create_sheet(nombre_hoja)
+    else:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = nombre_hoja
+
     # Detectar si el df tiene metadatos de tipo de fila
     tiene_tipos = "_tipo" in df.columns
     tipos = df["_tipo"].tolist() if tiene_tipos else None
     # Trabajar con df sin la columna interna
     df_render = df.drop(columns=["_tipo"]) if tiene_tipos else df
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Tabla"
 
     n_cols = len(df_render.columns)
 
@@ -555,12 +773,22 @@ def generar_imagen_tabla(df: pd.DataFrame, titulo: str, ruta_png: str) -> str | 
         top=Side(style="thin"),
         bottom=Side(style="thin"),
     )
+    # Color amarillo 50% transparencia (amarillo claro con texto negro para VENTORY)
+    COLOR_VENTORY_HEADER = (255, 255, 153)  # #FFFF99 amarillo 50% con blanco
+
     for col_idx, col_nombre in enumerate(df_render.columns, start=1):
         celda = ws.cell(row=2, column=col_idx, value=col_nombre)
-        celda.font = Font(name="Aptos Narrow", bold=True, size=10, color="FFFFFF")
-        celda.fill = _rgb(*COLOR_HEADER)
         celda.alignment = Alignment(horizontal="center", vertical="center")
         celda.border = borde_fino
+
+        # Formato especial para encabezado VENTORY
+        if col_nombre == "VENTORY":
+            celda.font = Font(name="Aptos Narrow", bold=True, size=10, color="000000")
+            celda.fill = _rgb(*COLOR_VENTORY_HEADER)
+        else:
+            celda.font = Font(name="Aptos Narrow", bold=True, size=10, color="FFFFFF")
+            celda.fill = _rgb(*COLOR_HEADER)
+
     ws.row_dimensions[2].height = 18
 
     # ── Filas de datos ────────────────────────────────────────────────────────
@@ -625,10 +853,12 @@ def generar_imagen_tabla(df: pd.DataFrame, titulo: str, ruta_png: str) -> str | 
         else:
             ws.column_dimensions[col_letter].width = anchos_fijos.get(col_nombre, 10)
 
-    wb.save(ruta_xlsx)
-    logging.info(f"Excel temporal guardado: {ruta_xlsx}")
+    # Solo guardar si no hay workbook existente (es decir, si es un wb aislado)
+    if wb_existente is None:
+        wb.save(ruta_xlsx)
+        logging.info(f"Excel temporal guardado: {ruta_xlsx}")
     # La captura real se hace en generar_imagenes_tablas() con una sola instancia de Excel
-    return ruta_xlsx
+    return (ruta_xlsx, nombre_hoja)
 
 
 def _capturar_xlsx_a_png(ws_xw, n_filas: int, n_cols: int, ruta_png: str) -> bool:
@@ -664,6 +894,9 @@ def _capturar_xlsx_a_png(ws_xw, n_filas: int, n_cols: int, ruta_png: str) -> boo
     # CopyPicture con hasta 3 reintentos
     for intento in range(3):
         try:
+            # Asegurar que el rango está seleccionado
+            xl_range.select()
+            time.sleep(0.2)
             xl_range.api.CopyPicture(Appearance=1, Format=2)
             time.sleep(1.5)
             img = ImageGrab.grabclipboard()
@@ -685,25 +918,51 @@ def _capturar_xlsx_a_png(ws_xw, n_filas: int, n_cols: int, ruta_png: str) -> boo
 
 def generar_imagenes_tablas(trabajos: list[tuple]) -> dict:
     """
-    Genera múltiples imágenes PNG en una sola instancia de Excel.
+    Genera múltiples imágenes PNG en UNA SOLA instancia de Excel.
 
     trabajos: lista de (df, titulo, ruta_png)
     Retorna {ruta_png: True/False}
+
+    Optimización: crea un único libro Excel con múltiples hojas (una por tabla)
+    en lugar de abrir/cerrar 3 libros por separado.
     """
+    import openpyxl
     import xlwings as xw
     import subprocess
 
     resultados = {ruta_png: False for _, _, ruta_png in trabajos}
-    xlsx_temps = []
 
-    # Paso 1: generar todos los xlsx con openpyxl (sin Excel)
-    for df, titulo, ruta_png in trabajos:
-        ruta_xlsx = generar_imagen_tabla(df, titulo, ruta_png)
+    # Paso 1: crear UN ÚNICO workbook con todas las hojas
+    wb = openpyxl.Workbook()
+    # Eliminar la hoja por defecto
+    if "Sheet" in wb.sheetnames:
+        del wb["Sheet"]
+
+    hojas_info = []  # lista de (ruta_xlsx_unico, nombre_hoja, ruta_png, n_filas, n_cols)
+
+    for idx, (df, titulo, ruta_png) in enumerate(trabajos):
+        nombre_hoja = ["VPA", "Zonal", "Supervisor"][idx] if idx < 3 else f"Tabla{idx}"
+
+        # Generar hoja dentro del workbook único
+        ruta_xlsx_unico, hoja_creada = generar_imagen_tabla(df, titulo, ruta_png, wb_existente=wb, nombre_hoja=nombre_hoja)
+
         # n_filas incluye título (1) + encabezado (1) + filas de datos; excluir col '_tipo' si existe
         n_cols_render = len(df.columns) - (1 if "_tipo" in df.columns else 0)
-        xlsx_temps.append((ruta_xlsx, ruta_png, len(df) + 2, n_cols_render))
+        n_filas_total = len(df) + 2  # título + encabezado + datos
+        hojas_info.append((ruta_xlsx_unico, hoja_creada, ruta_png, n_filas_total, n_cols_render))
 
-    # Paso 2: abrir Excel una sola vez y capturar todos
+    # Guardar el workbook UNA SOLA VEZ al final
+    ruta_xlsx_unico = hojas_info[0][0] if hojas_info else None
+    if ruta_xlsx_unico:
+        wb.save(ruta_xlsx_unico)
+        logging.info(f"Excel único guardado con {len(hojas_info)} hojas: {ruta_xlsx_unico}")
+
+    # Paso 2: abrir Excel UNA SOLA VEZ y capturar todos (con mutex)
+    lock = ScreenshotManager("MOVISTAR_CORTES")
+    if not lock.adquirir_lock(timeout=120):
+        logging.error("[LOCK] No se pudo adquirir lock de captura — otro proceso usa Excel. Omitiendo capturas.")
+        return resultados
+
     app = None
     try:
         subprocess.run(["taskkill", "/f", "/im", "EXCEL.EXE"], capture_output=True)
@@ -711,29 +970,38 @@ def generar_imagenes_tablas(trabajos: list[tuple]) -> dict:
         app = xw.App(visible=True, add_book=False)
         app.display_alerts = False
 
-        for ruta_xlsx, ruta_png, n_filas, n_cols in xlsx_temps:
-            if not ruta_xlsx or not os.path.exists(ruta_xlsx):
-                continue
+        # Abrir el workbook UNA SOLA VEZ
+        if ruta_xlsx_unico and os.path.exists(ruta_xlsx_unico):
             wb_xw = None
             try:
-                wb_xw = app.books.open(os.path.normpath(ruta_xlsx))
-                ws_xw = wb_xw.sheets["Tabla"]
-                ws_xw.activate()
-                time.sleep(0.5)
-                resultados[ruta_png] = _capturar_xlsx_a_png(ws_xw, n_filas, n_cols, ruta_png)
+                wb_xw = app.books.open(os.path.normpath(ruta_xlsx_unico))
+
+                # Capturar cada hoja
+                for ruta_xlsx, nombre_hoja, ruta_png, n_filas, n_cols in hojas_info:
+                    try:
+                        ws_xw = wb_xw.sheets[nombre_hoja]
+                        ws_xw.activate()
+                        time.sleep(0.3)
+                        resultados[ruta_png] = _capturar_xlsx_a_png(ws_xw, n_filas, n_cols, ruta_png)
+                        logging.info(f"Capturada hoja '{nombre_hoja}' → {ruta_png}")
+                    except Exception as e:
+                        logging.error(f"Error capturando hoja {nombre_hoja}: {e}")
+
             except Exception as e:
-                logging.error(f"Error capturando {ruta_png}: {e}")
+                logging.error(f"Error abriendo workbook único: {e}")
             finally:
                 if wb_xw:
                     try:
                         wb_xw.close()
                     except Exception:
                         pass
+                # Eliminar archivo DESPUÉS de cerrar
                 try:
-                    os.remove(ruta_xlsx)
+                    if ruta_xlsx_unico:
+                        os.remove(ruta_xlsx_unico)
                 except Exception:
                     pass
-                time.sleep(0.5)
+
     except Exception as e:
         logging.error(f"Error iniciando Excel para capturas: {e}")
     finally:
@@ -742,6 +1010,7 @@ def generar_imagenes_tablas(trabajos: list[tuple]) -> dict:
                 app.quit()
             except Exception:
                 pass
+        lock.liberar_lock()
 
     return resultados
 
@@ -805,7 +1074,8 @@ def construir_texto_resumen(df_zonal: pd.DataFrame, corte: str, fecha: date) -> 
 
 # ── Envíos WhatsApp ───────────────────────────────────────────────────────────
 
-def enviar_informe(wa: WhatsAppClient, df_zonal: pd.DataFrame, df_sup: pd.DataFrame, corte: str, fecha: date):
+def enviar_informe(wa: WhatsAppClient, df_zonal: pd.DataFrame, df_sup: pd.DataFrame, corte: str, fecha: date,
+                   df_todos_dia: pd.DataFrame = None, df_cuotas: pd.DataFrame = None):
     fecha_str = fecha.strftime("%d/%m/%Y")
 
     es_domingo = fecha.weekday() == 6  # domingo=6
@@ -868,6 +1138,11 @@ def enviar_informe(wa: WhatsAppClient, df_zonal: pd.DataFrame, df_sup: pd.DataFr
         logging.warning("No se pudo generar imagen supervisores — enviando solo texto.")
     time.sleep(8)
 
+    # ── Notificar a Carlos los supervisores que no reportaron ─────────────────
+    if df_todos_dia is not None and df_cuotas is not None:
+        time.sleep(5)
+        notificar_no_reportaron(wa, df_todos_dia, df_cuotas, corte, fecha)
+
     # Limpiar temporales
     for f in [png_vpa, png_zonal, png_sup]:
         try:
@@ -875,6 +1150,55 @@ def enviar_informe(wa: WhatsAppClient, df_zonal: pd.DataFrame, df_sup: pd.DataFr
                 os.remove(f)
         except Exception:
             pass
+
+
+# ── Notificación de no-reportaron (post-corte) ───────────────────────────────
+
+def notificar_no_reportaron(
+    wa: WhatsAppClient,
+    df_todos_dia: pd.DataFrame,
+    df_cuotas: pd.DataFrame,
+    corte: str,
+    fecha: date,
+):
+    """
+    Envía al grupo de supervisores un mensaje mencionando a Carlos Parra
+    con la lista de supervisores que NO enviaron su reporte en este corte.
+    Si todos reportaron, no envía nada.
+    """
+    todos_sups = []
+    if not df_cuotas.empty:
+        for _, fila in df_cuotas.iterrows():
+            sup = str(fila.get("SUPERVISOR", "")).strip()
+            if sup:
+                todos_sups.append(sup)
+
+    ya_reportaron = _supervisores_que_reportaron(df_todos_dia, corte)
+    no_reportaron = [s for s in todos_sups if s not in ya_reportaron]
+
+    fecha_str = fecha.strftime("%d/%m/%Y")
+    numero_carlos = CARLOS_WA_ID.replace("@c.us", "")
+
+    if not no_reportaron:
+        texto = (
+            f"Hola @{numero_carlos}, todos los supervisores reportaron a tiempo "
+            f"en el corte *{corte}* del *{fecha_str}*. ✅"
+        )
+        logging.info("Todos los supervisores reportaron — notificando a Carlos.")
+        wa.send_mention(GRUPO_SUPERVISORES, texto, [CARLOS_WA_ID])
+        return
+
+    lineas = "\n".join(f"  - {sup}" for sup in sorted(no_reportaron))
+    texto = (
+        f"Hola @{numero_carlos}, los siguientes supervisores no llegaron a reportar a tiempo "
+        f"en el corte *{corte}* del *{fecha_str}*:\n\n{lineas}"
+    )
+
+    logging.info(
+        f"Notificando a Carlos sobre {len(no_reportaron)} supervisores sin reporte en corte {corte}: "
+        + ", ".join(sorted(no_reportaron))
+    )
+    wa.send_mention(GRUPO_SUPERVISORES, texto, [CARLOS_WA_ID])
 
 
 # ── Alerta de supervisores pendientes ────────────────────────────────────────
@@ -1002,6 +1326,15 @@ def cargar_todos_del_dia(service, fecha_hoy: date) -> pd.DataFrame:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def _es_feriado(fecha: date) -> bool:
+    """Verifica si la fecha está en la lista de feriados (variable CORTES_FERIADOS_FECHAS del .env)."""
+    feriados_str = os.environ.get("CORTES_FERIADOS_FECHAS", "")
+    if not feriados_str:
+        return False
+    feriados = [datetime.strptime(f.strip(), "%Y-%m-%d").date() for f in feriados_str.split(",") if f.strip()]
+    return fecha in feriados
+
+
 def main():
     parser = argparse.ArgumentParser(description="Informe de cortes de ventas por WhatsApp")
     parser.add_argument(
@@ -1020,6 +1353,11 @@ def main():
         action="store_true",
         help="Modo alerta: notifica al grupo de supervisores pendientes (se ejecuta 10 min antes del corte).",
     )
+    parser.add_argument(
+        "--solo-generar",
+        action="store_true",
+        help="Solo genera las imágenes en temp/ sin enviar nada por WhatsApp. Útil para verificar el resultado visualmente.",
+    )
     args = parser.parse_args()
     corte = args.corte.upper()
 
@@ -1032,6 +1370,40 @@ def main():
         logging.info(f"Corte CIERRE: usando fecha de ayer ({fecha})")
     else:
         fecha = date.today()
+
+    # ── Validar si es feriado ────────────────────────────────────────────────────
+    if _es_feriado(fecha):
+        logging.warning(f"FERIADO DETECTADO ({fecha}) — script deshabilitado. No se ejecutará nada.")
+        sys.exit(0)
+
+    # ── Modo solo-generar: no necesita WhatsApp ───────────────────────────────
+    if args.solo_generar:
+        logging.info("=" * 60)
+        logging.info(f"MODO SOLO-GENERAR — {corte} | {fecha.strftime('%d/%m/%Y')}")
+        logging.info("=" * 60)
+        service = _autenticar_sheets()
+        logging.info("Leyendo CUOTAS...")
+        df_cuotas = _leer_hoja(service, "CUOTAS")
+        df_todos_dia = cargar_todos_del_dia(service, fecha)
+        n_corte_actual = len(df_todos_dia[df_todos_dia["CORTE"] == corte]) if not df_todos_dia.empty else 0
+        logging.info(f"Registros del dia: {len(df_todos_dia)} | Corte {corte}: {n_corte_actual}")
+        df_zonal = calcular_tabla_zonal(df_todos_dia, df_cuotas, corte, fecha)
+        df_sup   = calcular_tabla_supervisor(df_todos_dia, df_cuotas, corte, fecha, service=service)
+        fecha_str = fecha.strftime("%d/%m/%Y")
+        df_zonal_vpa = _insertar_filas_region(df_zonal)
+        png_vpa   = str(TEMP_DIR / f"corte_{corte}_zonal_vpa.png")
+        png_zonal = str(TEMP_DIR / f"corte_{corte}_zonal.png")
+        png_sup   = str(TEMP_DIR / f"corte_{corte}_sup.png")
+        generar_imagenes_tablas([
+            (df_zonal_vpa, f"VENTAS POR ZONAL — CORTE {corte} | {fecha_str}", png_vpa),
+            (df_zonal,     f"VENTAS POR ZONAL — CORTE {corte} | {fecha_str}", png_zonal),
+            (df_sup,       f"VENTAS POR SUPERVISOR — CORTE {corte} | {fecha_str}", png_sup),
+        ])
+        logging.info("Imagenes guardadas en temp/ — no se envio nada por WhatsApp.")
+        logging.info(f"  VPA:         {png_vpa}")
+        logging.info(f"  Zonal:       {png_zonal}")
+        logging.info(f"  Supervisor:  {png_sup}")
+        return
 
     # Conectar WhatsApp (necesario tanto para alerta como para informe)
     import json
@@ -1091,12 +1463,12 @@ def main():
 
     # Calcular tablas
     df_zonal = calcular_tabla_zonal(df_todos_dia, df_cuotas, corte, fecha)
-    df_sup = calcular_tabla_supervisor(df_todos_dia, df_cuotas, corte, fecha)
+    df_sup = calcular_tabla_supervisor(df_todos_dia, df_cuotas, corte, fecha, service=service)
 
     logging.info(f"Tabla zonal: {len(df_zonal)} filas | Tabla supervisores: {len(df_sup)} filas")
 
     # Enviar
-    enviar_informe(wa, df_zonal, df_sup, corte, fecha)
+    enviar_informe(wa, df_zonal, df_sup, corte, fecha, df_todos_dia=df_todos_dia, df_cuotas=df_cuotas)
 
     logging.info("=" * 60)
     logging.info("INFORME CORTES COMPLETADO")

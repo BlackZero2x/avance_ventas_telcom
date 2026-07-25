@@ -22,6 +22,10 @@ python cortes_ventas/cortes_ventas.py --corte CIERRE
 # Alerta previa (10 min antes del corte)
 python cortes_ventas/cortes_ventas.py --corte 12PM --alerta
 python cortes_ventas/cortes_ventas.py --corte CIERRE --alerta
+
+# Solo generar imágenes en temp/ sin enviar por WhatsApp (útil para revisar visualmente)
+python cortes_ventas/cortes_ventas.py --corte CIERRE --solo-generar
+python cortes_ventas/cortes_ventas.py --corte 12PM --solo-generar --fecha 16/06/2026
 ```
 
 ## Rutas importantes
@@ -59,11 +63,19 @@ Zonales no listadas aquí aparecen al final de la tabla sin encabezado de regió
 
 Se leen desde la columna `TELEFONO` de la hoja `CUOTAS` del Google Sheet. Formato aceptado: `9XXXXXXXX` (9 dígitos) o `519XXXXXXXX` (con prefijo 51). Se usan para las menciones en las alertas previas.
 
-## Google Sheet
+## Google Sheets
 
+### Cortes de Ventas
 ID en variable de entorno `CORTES_SHEET_ID`. Hojas utilizadas:
 - `Respuestas` — registros enviados por supervisores (ZONAL, SUP, CORTE, FECHA_CORTE, VENTA_REGULAR, VENTA_FLEX)
 - `CUOTAS` — cuotas diarias por supervisor (ZONAL, SUPERVISOR, CUOTA_DIA, TELEFONO)
+
+### VENTORY — Ventas Registradas
+ID en variable de entorno `SHEET_ID_VENTORY` (gid=1543273197). 
+La tabla de SUPERVISOR ahora incluye columna `VENTAS_REGISTRADAS_HOY`:
+- Contador acumulado de ventas registradas durante el día hasta la hora actual
+- Filtros: `DAY = "HOY"`, `Vta_Hoy = "Si"`, `HORA <= hora_actual`
+- Ver `VENTORY_INTEGRACIÓN.md` para detalles
 
 ## Tareas programadas
 
