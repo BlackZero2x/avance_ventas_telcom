@@ -222,7 +222,9 @@ def _normalizar_nombre_sup(nombre: str) -> str:
         c for c in unicodedata.normalize('NFD', nombre)
         if unicodedata.category(c) != 'Mn'
     )
-    return nombre_sin_acentos.strip().upper()
+    # Eliminar espacios dobles/múltiples y normalizar a un solo espacio
+    nombre_normalizado = ' '.join(nombre_sin_acentos.split())
+    return nombre_normalizado.strip().upper()
 
 
 def _leer_ventory_ventas(service, fecha_hoy: date) -> dict:
