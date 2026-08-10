@@ -27,6 +27,14 @@ versiones/
 cuotas*.xlsx
 altas_historico.xlsx
 
+# Capturas con datos reales (nombres/cifras de vendedores) — no versionar
+tabla_sup.PNG
+tabla_sup.jpeg
+Cuadro_resumen_sup/*.png
+Cuadro_resumen_sup/*.PNG
+Cuadro_resumen_sup/*.jpeg
+Cuadro_resumen_sup/*.jpg
+
 # Runtime / estado
 execution_log.json
 processed_emails.txt
