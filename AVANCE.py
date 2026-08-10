@@ -1083,7 +1083,6 @@ df        = pd.read_sql(sql,     engine)
 df_rt     = pd.read_sql(sql_rt,  engine)
 df_con    = pd.read_sql(sql_con, engine)
 df_ant    = pd.read_sql(sql_ant, engine)   # altas del mes anterior
-engine.dispose()
 
 # ── Google Sheets: VENTORY y RH ────────────────────────────────
 URL_VENTORY = os.environ.get("URL_VENTORY", "https://docs.google.com/spreadsheets/d/e/2PACX-1vSXxqrGGs4_mU4n511v3zBkKo4buAFv0TwrlrrX4XD2jFjIT7cC8kvH7ER32Ye2hiOpo3mAFsUkyydg/pub?gid=22270598&single=true&output=csv")
@@ -1094,18 +1093,49 @@ def _read_gsheet_csv(url):
     return pd.read_csv(io.BytesIO(resp.content), encoding="utf-8")
 
 ventory = _read_gsheet_csv(URL_VENTORY)
+ventory = ventory.rename(columns={
+    "Fecha Registro": "Fecha_Registro",
+    "Cód. FE":        "codigo_fe",
+    "Cód. Petición":  "peticion",
+})
 rh      = _read_gsheet_csv(URL_RH)
 rh["ESQUEMA"] = rh["ESQUEMA"].replace("PART-TIME", "PLANILLA")
-_MF_CSV = Path(os.environ.get("MF_CSV_PATH", r"C:\Users\developer2\Documents\vpncompartido\BD_Ventas_AUREN.csv"))
-_mf_raw = pd.read_csv(_MF_CSV, encoding="utf-8-sig", low_memory=False)
-# La columna AÑO_REG puede tener la ñ corrupta según el encoding del CSV
-_col_anio_mf = next((c for c in _mf_raw.columns if "O_REG" in c and c != "MES_REG"), "AÑO_REG")
-_mf_raw = _mf_raw.rename(columns={_col_anio_mf: "AÑO_REG"})
+# ── MiFibra: tabla SQL [dbo].[mifibra_ventas] (misma base eAuren) ──
+_MF_SQL_RENAME = {
+    "numero_contrato":            "NUMERO CONTRATO",
+    "num_doc":                    "NUM DOC",
+    "estado_orden_servicio_2":    "ESTADO ORDEN SERVICIO 2",
+    "estado_ficha_contrato":      "ESTADO FICHA CONTRATO",
+    "motivo_de_observacion":      "MOTIVO DE OBSERVACION",
+    "motivo_desaprobacion":       "MOTIVO DESAPROBACION",
+    "vendedor":                   "VENDEDOR",
+    "paquete_inicial":            "PAQUETE INICIAL",
+    "plan_final":                 "PLAN FINAL",
+    "fecha_de_venta":             "FECHA DE VENTA",
+    "fecha_de_instalacion":       "FECHA DE INSTALACION",
+    "ano_reg":                    "AÑO_REG",
+    "mes_reg":                    "MES_REG",
+    "filial":                     "FILIAL",
+    "consolidado_cnt":            "CONSOLIDADO CNT",
+    "aplica":                     "APLICA",
+    "porta":                      "PORTA",
+    "categoria":                  "CATEGORIA",
+    "motivo_de_anulacion":        "MOTIVO DE ANULACION",
+    "estado_servicio_internet":   "ESTADO SERVICIO INTERNET",
+    "fecha_corte_definitivo":     "FECHA CORTE DEFINITIVO",
+    "paquete_inicial_ott":        "PAQUETE INICIAL OTT",
+}
+_mf_raw = pd.read_sql("SELECT * FROM [dbo].[mifibra_ventas]", engine)
+_mf_raw = _mf_raw.rename(columns=_MF_SQL_RENAME)
+_mf_raw["MES_REG"] = pd.to_numeric(_mf_raw["MES_REG"], errors="coerce").astype("Int64")
+_mf_raw["AÑO_REG"] = pd.to_numeric(_mf_raw["AÑO_REG"], errors="coerce").astype("Int64")
 _mf_raw["FILIAL"] = _mf_raw["FILIAL"].str.upper().str.strip()
 _mf_raw.loc[_mf_raw["FILIAL"].str.contains("ANCASH",      na=False), "FILIAL"] = "CHIMBOTE"
 _mf_raw.loc[_mf_raw["FILIAL"].str.contains("LA LIBERTAD", na=False), "FILIAL"] = "TRUJILLO"
 mf = _mf_raw[_mf_raw["ESTADO ORDEN SERVICIO 2"].str.strip() == "LIQUIDADA"].copy()
 mf_ventas = _mf_raw.copy()   # todas las filas sin filtro de estado
+
+engine.dispose()
 
 # ── Google Sheet MiFibra (fuente secundaria, acceso autenticado) ──
 # Se descarga la hoja "MiFibra" del Sheet privado y se combina con
