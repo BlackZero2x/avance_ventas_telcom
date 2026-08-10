@@ -77,6 +77,7 @@ from modules.shared.execution_log import registrar_modulo, registrar_avance_ok, 
 from wa_client import WhatsAppClient
 from backs_process import BacksProcess
 from jefes_process import JefesProcess
+from jefes_email_process import JefesEmailProcess
 from jesus_process import JesusProcess
 from cristian_process import CristianProcess
 from guillermo_process import GuillermnoProcess
@@ -106,7 +107,7 @@ SCOPES = [
 
 CONFIG_PATH = "C:/proyectos/AVANCE_MOVISTAR/config.json"
 
-with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
     config = json.load(f)
 
 os.makedirs(config["temp_dir"], exist_ok=True)
@@ -181,10 +182,18 @@ def _ejecutar_avance():
 
 # ── Modulos ────────────────────────────────────────────────────────────────────
 
-def _run(modulo, sheets_service, gmail_service, wa):
+def _run(modulo, sheets_service, gmail_service, wa, forzar=False):
+    temp_dir = config.get("temp_dir", "")
+    captura_tds1 = os.path.join(temp_dir, "captura_tds_1.png")
+    captura_tds2 = os.path.join(temp_dir, "captura_tds_2.png")
+
     MODULOS = {
         "backs":            lambda: BacksProcess(config, sheets_service, wa).execute(),
         "jefes":            lambda: JefesProcess(config, wa).execute(),
+        "jefes_email":      lambda: JefesEmailProcess(config, gmail_service).execute(
+                                captura_tds1=captura_tds1 if os.path.exists(captura_tds1) else None,
+                                captura_tds2=captura_tds2 if os.path.exists(captura_tds2) else None,
+                            ),
         "jesus":            lambda: JesusProcess(config, wa).execute(),
         "cristian":         lambda: CristianProcess(config, wa).execute(),
         "guillermo":        lambda: GuillermnoProcess(config, wa, gmail_service).execute(),
@@ -194,12 +203,36 @@ def _run(modulo, sheets_service, gmail_service, wa):
     }
 
     if modulo == "todos":
-        avance_ok = _ejecutar_avance()
-        if not avance_ok:
-            registrar_avance_fallo("AVANCE.py termino con error")
-            registrar_fin(False, "AVANCE.py termino con error")
-            sys.exit(1)
-        registrar_avance_ok()
+        from main_v2 import _verificar_datos_frescos
+        periodo = config.get("periodo", "")
+        if forzar:
+            logging.warning(f"--forzar activo: se omite verificacion de datos frescos (periodo={periodo})")
+        elif periodo:
+            logging.info(f"Verificando datos SQL para periodo {periodo}...")
+            datos_ok, motivo = _verificar_datos_frescos(periodo)
+            if datos_ok:
+                logging.info(f"[OK] {motivo}")
+            else:
+                logging.error(f"[DATOS DESACTUALIZADOS] {motivo}")
+                logging.error("Abortando ejecucion manual. Usa --forzar para saltear esta verificacion.")
+                sys.exit(1)
+        else:
+            logging.warning("Periodo no definido en config — se omite verificacion de datos")
+
+        # Si ya existe el AVANCE del periodo, no regenerar
+        from modules.shared.avance_finder import buscar_avance as _buscar_avance_existente
+        archivo_existente = _buscar_avance_existente(config["archivos_avance_dir"], config)
+        if archivo_existente:
+            logging.info(f"Archivo AVANCE existente detectado: {archivo_existente}")
+            logging.info("Saltando ejecucion de AVANCE.py (archivo ya generado)")
+            registrar_avance_ok()
+        else:
+            avance_ok = _ejecutar_avance()
+            if not avance_ok:
+                registrar_avance_fallo("AVANCE.py termino con error")
+                registrar_fin(False, "AVANCE.py termino con error")
+                sys.exit(1)
+            registrar_avance_ok()
 
         results = {}
         for nombre, fn in MODULOS.items():
@@ -231,7 +264,7 @@ def _run(modulo, sheets_service, gmail_service, wa):
             registrar_modulo(modulo, False)
             raise
     else:
-        print(f"Modulo '{modulo}' no reconocido. Opciones: {', '.join(MODULOS)}, todos")
+        print(f"Modulo '{modulo}' no reconocido. Opciones: {', '.join(list(MODULOS) + ['todos'])}")
         sys.exit(1)
 
 
@@ -239,13 +272,15 @@ def _run(modulo, sheets_service, gmail_service, wa):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Uso: python run_modulo.py <modulo>")
+        print("Uso: python run_modulo.py <modulo> [--forzar]")
         print("Modulos disponibles: backs, jefes, jesus, cristian, guillermo, carlos, italo, supervisor_alert, todos")
+        print("  --forzar  Salta la verificacion de datos frescos (util para periodos pasados)")
         sys.exit(1)
 
     modulo = sys.argv[1].lower()
+    _forzar = "--forzar" in sys.argv
 
     sheets_service, gmail_service = _autenticar_google()
     wa = _conectar_whatsapp()
 
-    _run(modulo, sheets_service, gmail_service, wa)
+    _run(modulo, sheets_service, gmail_service, wa, forzar=_forzar)

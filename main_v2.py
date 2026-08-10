@@ -14,16 +14,15 @@ Procesos en orden:
   2. JefesProcess   — capturas TDS + SEGUIMIENTO_VDD → grupo JEFES
   3. JesusProcess   — envia AVANCE_{fecha}.xlsx a Jesus
   4. CristianProcess — envia AVANCE_{fecha}.xlsx a Cristian
-  5. GuillermnoProcess — envia AVANCE_{fecha}.xlsx a Guillermo por WhatsApp + correo (Gmail)
-  6. CarlosProcess  — envia AVANCE_{fecha}.xlsx a Carlos por correo (Gmail)
-  6. ItaloProcess   — carga AVANCE_VTAS_APPVENTORY → Sheets → notifica Italo
+  5. GuillermnoProcess — envia AVANCE_{fecha}.xlsx a Guillermo por WhatsApp
+  6. JefesEmailProcess — correo consolidado a Carlos + Guillermo + Jesús con captura TDS2 en el cuerpo
 """
 import json
 import logging
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 from urllib.parse import quote
 
@@ -93,12 +92,71 @@ from jesus_process import JesusProcess
 from cristian_process import CristianProcess
 from guillermo_process import GuillermnoProcess
 from carlos_process import CarlosProcess
+from jefes_email_process import JefesEmailProcess
 from italo_process import ItaloProcess
 from supervisor_alert_process import SupervisorAlertProcess
+from cuadro_resumen_sup_process import procesar_cuadro_resumen_sup
 from shared.execution_log import (
     registrar_trigger, registrar_avance_ok, registrar_avance_fallo,
     registrar_modulo, registrar_fin,
 )
+
+# ── Verificación de datos SQL actualizados ─────────────────────────────────────
+
+def _verificar_datos_frescos(periodo: str) -> tuple[bool, str]:
+    """
+    Verifica que en SQL Server haya registros de ALTAS con fecha_alta = ayer (D-1).
+    Retorna (ok: bool, mensaje: str).
+    """
+    import urllib.parse
+    from datetime import date, timedelta
+
+    try:
+        from sqlalchemy import create_engine, text as sa_text
+
+        server   = os.environ.get("SQL_SERVER",   r"AUREN22\AUREN")
+        database = os.environ.get("SQL_DATABASE", "eAuren")
+        user     = os.environ.get("SQL_USER",     "")
+        password = os.environ.get("SQL_PASSWORD", "")
+
+        params = urllib.parse.quote_plus(
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={server};"
+            f"DATABASE={database};"
+            f"UID={user};"
+            f"PWD={password};"
+        )
+        engine = create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
+
+        ayer = (date.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+        anio_mes = periodo  # formato YYYY-MM
+
+        query = sa_text("""
+            SELECT COUNT(*) AS cnt,
+                   CONVERT(CHAR(10), MAX(CAST(a.fecha_alta AS DATE)), 126) AS max_fecha
+            FROM fija_altas a
+            WHERE FORMAT(a.fecha_alta, 'yyyy-MM') = :periodo
+        """)
+
+        with engine.connect() as conn:
+            row = conn.execute(query, {"periodo": anio_mes}).fetchone()
+
+        cnt       = row[0] if row else 0
+        max_fecha = row[1] if row else None
+
+        if cnt == 0:
+            return False, f"SQL no tiene registros de ALTAS para el periodo {anio_mes}"
+
+        if max_fecha != ayer:
+            return False, (
+                f"Datos SQL desactualizados: max fecha_alta = {max_fecha}, "
+                f"se esperaba {ayer} (D-1)"
+            )
+
+        return True, f"Datos OK: {cnt} ALTAS, max fecha = {max_fecha}"
+
+    except Exception as e:
+        return False, f"Error al consultar SQL para verificar datos: {e}"
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 _avance_dir = os.environ.get("AVANCE_DIR", "C:/proyectos/AVANCE_MOVISTAR")
@@ -123,6 +181,17 @@ SCOPES = [
 
 CONFIG_PATH    = os.environ.get("CONFIG_PATH", f"{_avance_dir}/config.json")
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL_MINUTES", "10")) * 60
+
+# Feriados en Perú (día, mes)
+FERIADOS_PERU = {
+    (28, 7),  # 28 de julio - Independencia del Perú
+    (29, 7),  # 29 de julio - Feriado cívico / Festividad
+}
+
+def _es_feriado():
+    """Retorna True si hoy es feriado en Perú."""
+    hoy = date.today()
+    return (hoy.day, hoy.month) in FERIADOS_PERU
 
 
 class Orchestrator:
@@ -153,7 +222,7 @@ class Orchestrator:
             logging.error(f"No se encontró config.json en: {path}")
             sys.exit(1)
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8-sig") as f:
                 cfg = json.load(f)
         except json.JSONDecodeError as e:
             logging.error(f"config.json tiene formato JSON inválido: {e}")
@@ -166,7 +235,7 @@ class Orchestrator:
 
     @staticmethod
     def _validar_env_emails():
-        faltantes = [v for v in ("GUILLERMO_EMAIL", "CARLOS_EMAIL") if not os.environ.get(v, "").strip()]
+        faltantes = [v for v in ("CARLOS_EMAIL", "GUILLERMO_EMAIL", "JESUS_EMAIL") if not os.environ.get(v, "").strip()]
         if faltantes:
             logging.error(f"Variables de entorno requeridas no definidas en .env: {faltantes}")
             sys.exit(1)
@@ -184,6 +253,18 @@ class Orchestrator:
         self.processed_ids.add(email_id)
         with open(self.config["processed_emails_file"], "a") as f:
             f.write(f"{email_id}\n")
+
+    def _obtener_ultimo_avance(self) -> str:
+        """Obtiene la ruta del archivo AVANCE más reciente."""
+        avance_dir = self.config.get("archivos_avance_dir", ".")
+        archivos = sorted(
+            (f for f in os.listdir(avance_dir) if f.startswith("AVANCE_") and f.endswith(".xlsx")),
+            key=lambda x: os.path.getmtime(os.path.join(avance_dir, x)),
+            reverse=True
+        )
+        if archivos:
+            return os.path.join(avance_dir, archivos[0])
+        return None
 
     # ── Google Auth ────────────────────────────────────────────────────────────
 
@@ -323,6 +404,16 @@ class Orchestrator:
         except Exception as _e:
             logging.warning(f"  No se pudo cerrar Excel: {_e}")
 
+    # Destinatarios del correo de diagnóstico cuando AVANCE.py falla.
+    # Leer desde variable de entorno (lista separada por comas) o usar lista fija.
+    _AVANCE_ERROR_RECIPIENTS = [
+        r for r in os.environ.get(
+            "AVANCE_ERROR_RECIPIENTS",
+            "augusto.moreno@auren.com.pe,jose.huiza@auren.com.pe,"
+            "sistemas@auren.com.pe",
+        ).split(",") if r.strip()
+    ]
+
     def _ejecutar_avance(self):
         self._notificar_inicio_avance()
         logging.info("[0/6] Ejecutando AVANCE.py para generar archivos del dia...")
@@ -340,12 +431,59 @@ class Orchestrator:
             for line in result.stdout.strip().splitlines():
                 logging.info(f"  [AVANCE] {line}")
         if result.returncode != 0:
-            if result.stderr:
-                logging.error(result.stderr[-2000:])
+            stderr_texto = result.stderr or ""
+            if stderr_texto:
+                logging.error(stderr_texto[-2000:])
             logging.error("AVANCE.py termino con error — abortando")
+            self._enviar_diagnostico_error(stderr_texto, result.stdout or "")
             return False
         logging.info("[OK] AVANCE.py completado")
         return True
+
+    def _enviar_diagnostico_error(self, stderr: str, stdout: str):
+        """Envía correo de diagnóstico cuando AVANCE.py falla."""
+        try:
+            from shared.error_diagnostico import diagnosticar, formatear_html
+            from shared.gmail_helper import GmailHelper
+
+            diag     = diagnosticar(stderr, stdout)
+            proyecto = os.path.dirname(os.path.abspath(__file__))
+            html     = formatear_html(diag, stderr, str(log_file), proyecto,
+                                      hostname="developer7")
+
+            asunto = f"[AVANCE MOVISTAR] Error en AVANCE.py — {diag['titulo']}"
+            destinatarios = self._AVANCE_ERROR_RECIPIENTS
+
+            gmail = GmailHelper(self.gmail_service)
+            ok = gmail.send_email_html(destinatarios, asunto, html)
+            if ok:
+                logging.info(f"[OK] Correo de diagnostico enviado a: {', '.join(destinatarios)}")
+            else:
+                logging.warning("No se pudo enviar el correo de diagnostico")
+        except Exception as e:
+            logging.error(f"Error al enviar correo de diagnostico: {e}")
+
+    def _ejecutar_carga_aqp(self):
+        import subprocess
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "carga_info_aqp", "carga_datos_hoja_aqp.py")
+        logging.info("[AQP] Iniciando carga de datos Arequipa → Google Sheets...")
+        try:
+            result = subprocess.run(
+                [sys.executable, script],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=300,
+            )
+            if result.stdout:
+                for line in result.stdout.strip().splitlines():
+                    logging.info("  [AQP] %s", line)
+            if result.returncode == 0:
+                logging.info("[AQP] carga_datos_hoja_aqp completado OK.")
+            else:
+                if result.stderr:
+                    logging.error("[AQP] stderr: %s", result.stderr[-2000:])
+                logging.warning("[AQP] carga_datos_hoja_aqp terminó con código %s.", result.returncode)
+        except Exception as e:
+            logging.warning("[AQP] carga_datos_hoja_aqp falló: %s", e)
 
     def _reconectar_whatsapp(self):
         intentos = 0
@@ -381,12 +519,46 @@ class Orchestrator:
         except Exception as e:
             logging.warning(f"No se pudo enviar aviso 'trigger llego': {e}")
 
+    def _avisar_datos_desactualizados(self, motivo: str):
+        """Envía WA al owner avisando que los datos SQL no están al día."""
+        owner_id = os.environ.get("OWNER_WA_ID", "").strip()
+        if not owner_id:
+            logging.warning("OWNER_WA_ID no definido en .env — no se puede notificar al owner")
+            return
+        try:
+            msg = (
+                f"[AVANCE MOVISTAR] El trigger llego pero los datos SQL no estan actualizados.\n"
+                f"Motivo: {motivo}\n"
+                f"El proceso NO se ejecuto. Revisar base de datos."
+            )
+            self.wa.send_text(owner_id, msg)
+            logging.info(f"[OK] Aviso de datos desactualizados enviado a owner ({owner_id})")
+        except Exception as e:
+            logging.error(f"Error al enviar aviso al owner: {e}")
+
     def _run_all(self, email_id):
         logging.info("=" * 70)
         logging.info("EJECUTANDO TODOS LOS PROCESOS")
         logging.info("=" * 70)
 
         self._avisar_trigger_llego_si_corresponde()
+
+        # ── Verificar que los datos SQL estén al día (D-1) ────────────────────
+        periodo = self.config.get("periodo", "")
+        if periodo:
+            logging.info(f"Verificando datos SQL para periodo {periodo}...")
+            datos_ok, motivo = _verificar_datos_frescos(periodo)
+            if datos_ok:
+                logging.info(f"[OK] {motivo}")
+            else:
+                logging.error(f"[DATOS DESACTUALIZADOS] {motivo}")
+                self._avisar_datos_desactualizados(motivo)
+                self._marcar_procesado(email_id)
+                registrar_avance_fallo(motivo)
+                registrar_fin(False, motivo)
+                return
+        else:
+            logging.warning("Periodo no definido en config — se omite verificacion de datos")
 
         if not self._ejecutar_avance():
             self._marcar_procesado(email_id)
@@ -396,9 +568,16 @@ class Orchestrator:
 
         registrar_avance_ok()
 
+        # AQP en standby: pendiente actualizar SHEET_ID antes de reactivar.
+        # self._ejecutar_carga_aqp()
+
         if not self.wa.is_ready():
             logging.warning("WhatsApp no disponible antes de iniciar procesos. Esperando...")
             self._reconectar_whatsapp()
+
+        temp_dir = self.config.get("temp_dir", "")
+        captura_tds1 = os.path.join(temp_dir, "captura_tds_1.png")
+        captura_tds2 = os.path.join(temp_dir, "captura_tds_2.png")
 
         pasos = [
             ("backs",            lambda: BacksProcess(self.config, self.sheets_service, self.wa).execute()),
@@ -407,8 +586,13 @@ class Orchestrator:
             ("cristian",         lambda: CristianProcess(self.config, self.wa).execute()),
             ("guillermo",        lambda: GuillermnoProcess(self.config, self.wa, self.gmail_service).execute()),
             ("carlos",           lambda: CarlosProcess(self.config, self.gmail_service, self.wa).execute()),
+            ("jefes_email",      lambda: JefesEmailProcess(self.config, self.gmail_service).execute(
+                                     captura_tds1=captura_tds1 if os.path.exists(captura_tds1) else None,
+                                     captura_tds2=captura_tds2 if os.path.exists(captura_tds2) else None,
+                                 )),
             ("italo",            lambda: ItaloProcess(self.config, self.sheets_service, self.wa).execute()),
             ("supervisor_alert", lambda: SupervisorAlertProcess(self.config, self.wa).execute()),
+            ("cuadro_resumen_sup", lambda: procesar_cuadro_resumen_sup(self._obtener_ultimo_avance())),
         ]
 
         results = {}
@@ -439,6 +623,14 @@ class Orchestrator:
     # ── Loop principal ─────────────────────────────────────────────────────────
 
     def start(self):
+        # Verificar si es feriado en Perú
+        if _es_feriado():
+            fecha_hoy = date.today().strftime("%d de julio de %Y")
+            logging.info("=" * 70)
+            logging.info(f"[FERIADO] Hoy es {fecha_hoy} — Proceso AVANCE MOVISTAR deshabilitado.")
+            logging.info("=" * 70)
+            sys.exit(0)
+
         self._autenticar_google()
 
         if not self._conectar_whatsapp():
