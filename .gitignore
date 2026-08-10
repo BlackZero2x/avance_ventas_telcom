@@ -4,6 +4,10 @@ credentials.json
 token.json
 config.json
 whatsapp_server/config.json
+CargaBaseFija/*service*.json
+CargaBaseFija/dist/
+CargaBaseFija/build/
+CargaBaseFija/*.spec
 
 # WhatsApp session & cache
 whatsapp_server/session_data/
@@ -42,6 +46,8 @@ venv/
 
 # Logs
 logs/
+cortes_ventas/logs/
+cortes_ventas/temp/
 *.log
 
 # OS

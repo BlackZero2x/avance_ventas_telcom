@@ -1,0 +1,3 @@
+# Dependencias adicionales solo para compilar el .exe de este subproyecto.
+# openpyxl, google-auth y gspread ya viven en C:\proyectos\requirements.txt
+pyinstaller>=6.0.0
