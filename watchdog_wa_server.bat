@@ -1,6 +1,8 @@
 @echo off
 :: Watchdog del servidor WhatsApp.
-:: El Programador de Tareas lo ejecuta cada 15 minutos (lun-vie, 08:00-18:00).
+:: El Programador de Tareas lo ejecuta cada 15 minutos, todos los dias, todo el dia
+:: (ampliado el 20/07/2026: antes era lun-vie 08:00-18:00 y el servidor quedaba sin
+::  vigilancia de noche y fines de semana, cuando SSFF/VPN tambien envian).
 :: Solo actua si el health falla — no mata ni reinicia si el servidor esta OK.
 
 setlocal
@@ -58,6 +60,13 @@ if exist "%PROFILE_DIR%\Default\lock"     del /F /Q "%PROFILE_DIR%\Default\lock"
 if exist "%PROFILE_DIR%\Default\lockfile" del /F /Q "%PROFILE_DIR%\Default\lockfile" >NUL 2>&1
 
 :lanzar
+:: Instancia unica: matar cualquier node huerfano antes de lanzar uno nuevo.
+:: Evita el doble arranque (dos wa_server.js compitiendo por la sesion WA).
+echo [%date% %time%] Watchdog: matando node huerfano antes de relanzar... >> "%LOG_FILE%"
+taskkill /F /IM node.exe   >NUL 2>&1
+taskkill /F /IM chrome.exe >NUL 2>&1
+ping 127.0.0.1 -n 4 >NUL
+
 cd /d "%SERVER_DIR%"
 start /min "wa_server" "%NODE_EXE%" "%SERVER_JS%"
 echo [%date% %time%] Watchdog: servidor relanzado, esperando hasta 5 min... >> "%LOG_FILE%"

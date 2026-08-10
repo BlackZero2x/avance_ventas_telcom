@@ -37,7 +37,7 @@ class WhatsAppClient:
     def _load_config(self):
         """Carga la configuración desde config.json."""
         try:
-            with open(self.config_path, "r", encoding="utf-8") as f:
+            with open(self.config_path, "r", encoding="utf-8-sig") as f:
                 return json.load(f)
         except FileNotFoundError:
             print(f"[WARN] config.json no encontrado en {self.config_path}")
@@ -55,14 +55,39 @@ class WhatsAppClient:
                 else:
                     resp = requests.post(url, json=kwargs.get("json"), timeout=60)
 
+                # Intentar parsear JSON
+                try:
+                    resp_json = resp.json()
+                except:
+                    resp_json = {}
+
+                # Validar HTTP 200 pero también verificar si hay "error" en el JSON
                 if resp.status_code == 200:
-                    return {"success": True, "data": resp.json()}
+                    # Si el servidor devolvió un error en el body (incluso con HTTP 200)
+                    if resp_json.get("error"):
+                        error_msg = resp_json.get("error")
+                        # Detectar errores de Puppeteer específicos
+                        if "Promise was collected" in error_msg or "Protocol error" in error_msg:
+                            last_error = f"Servidor puppeteer inestable: {error_msg[:100]}"
+                            print(f"  [Intento {attempt}/{self.max_retries}] {last_error}")
+                            if attempt < self.max_retries:
+                                time.sleep(self.retry_delay * attempt * 2)  # espera más larga para Puppeteer
+                                continue
+                        return {"success": False, "error": error_msg, "status": 200}
+                    return {"success": True, "data": resp_json}
                 elif resp.status_code == 503:
-                    print(f"  [Intento {attempt}/{self.max_retries}] WhatsApp no está listo, esperando...")
-                    time.sleep(self.retry_delay * attempt)
+                    error_msg = resp_json.get("error", "")
+                    if "Cola llena" in error_msg:
+                        # Cola saturada — esperar poco, se libera en segundos
+                        print(f"  [Intento {attempt}/{self.max_retries}] {error_msg} Reintentando en 8s...")
+                        time.sleep(8)
+                    else:
+                        # Servidor no listo (reconectando) — esperar más
+                        print(f"  [Intento {attempt}/{self.max_retries}] WhatsApp no esta listo, esperando {self.retry_delay * attempt}s...")
+                        time.sleep(self.retry_delay * attempt)
                     continue
                 else:
-                    error_data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"error": resp.text}
+                    error_data = resp_json if resp_json else {"error": resp.text}
                     return {"success": False, "error": error_data.get("error", resp.text), "status": resp.status_code}
 
             except requests.ConnectionError:
