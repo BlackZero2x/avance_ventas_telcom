@@ -5,7 +5,7 @@ Lee VDD2 del último AVANCE_{fecha}.xlsx y por cada supervisor envía
 a su contacto de WhatsApp (si está en config) un resumen de:
   - Vendedores INACTIVOS
   - Vendedores ACTIVOS SIN CIERRE
-  - Top-3 con mayor RATIO_CON_A_ALT (señal predictiva de cierre)
+  - Top-3 con mayor RATIO_ALT_A_CON (señal predictiva de cierre, ~15% esperado)
   - Texto de acción sugerida
 
 El resumen para JEFES incluye todas las zonales en una sola tabla.
@@ -28,18 +28,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "whatsapp_server"))
 
 from msg_utils import pick_variant
+from shared.avance_finder import buscar_avance as _buscar_avance_helper
 
 
-def _buscar_avance(directorio):
-    ayer = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    candidatos = [
-        os.path.join(directorio, f"AVANCE_{ayer}.xlsx"),
-        os.path.join(directorio, f"AVANCE_{datetime.now().strftime('%Y-%m-%d')}.xlsx"),
-    ]
-    for p in candidatos:
-        if os.path.exists(p):
-            return p
-    return None
+def _buscar_avance(directorio, config=None):
+    return _buscar_avance_helper(directorio, config)
 
 
 def _leer_vdd2(archivo):
@@ -84,9 +77,9 @@ def _enriquecer_vdd2(df):
 
     df["_ESTADO"] = df.apply(_estado, axis=1)
 
-    # Ratio CON/ALT de últimos 3 días, con cap en 1 (igual que fórmula Excel de VDD2)
+    # Ratio ALT/CON de últimos 3 días (~15% esperado); None si no hay CON
     df["_RATIO"] = df.apply(
-        lambda r: min(round(r["_CON_ULT3"] / r["_ALT_ULT3"], 2), 1) if r["_ALT_ULT3"] > 0 else None,
+        lambda r: round(r["_ALT_ULT3"] / r["_CON_ULT3"], 4) if r["_CON_ULT3"] > 0 else None,
         axis=1,
     )
 
@@ -121,7 +114,7 @@ def _resumen_supervisor(df_sup, nombre_sup):
             nombre = row.get("VENDEDOR", "?")
             antig  = row.get("ANTIG", "?")
             ratio  = row.get("_RATIO", None)
-            ratio_str = f" — ratio {ratio:.2f}" if isinstance(ratio, float) else ""
+            ratio_str = f" — ratio {ratio:.1%}" if isinstance(ratio, float) else ""
             lines.append(f"  - {nombre} [{antig}]{ratio_str}")
         lines.append("")
 
@@ -132,9 +125,9 @@ def _resumen_supervisor(df_sup, nombre_sup):
     ].copy()
     if not activos_con_ratio.empty:
         top3 = activos_con_ratio.nlargest(3, "_RATIO")
-        lines.append("*Top-3 ratio CON-ALT (mejor conversion):*")
+        lines.append("*Top-3 ratio ALT/CON (mejor conversion):*")
         for _, row in top3.iterrows():
-            lines.append(f"  - {row.get('VENDEDOR','?')}: {row['_RATIO']:.2f}")
+            lines.append(f"  - {row.get('VENDEDOR','?')}: {row['_RATIO']:.1%}")
         lines.append("")
 
     # Acción sugerida según distribución
@@ -196,7 +189,7 @@ def _resumen_ejecutivo_jefes(df, fecha_str):
         sin_rt = len(grp[grp["_ESTADO"] == "INACTIVO"])
 
         ratios = grp["_RATIO"].dropna()
-        ratio_prom = f"{ratios.mean():.2f}" if not ratios.empty else "-"
+        ratio_prom = f"{ratios.mean():.1%}" if not ratios.empty else "-"
 
         if sin_rt == 0:
             etiqueta = "✅"
@@ -223,8 +216,10 @@ def _resumen_ejecutivo_jefes(df, fecha_str):
     activos_df = df[df["_ESTADO"] != "INACTIVO"].dropna(subset=["_RATIO"])
     ratio_por_zonal = activos_df.groupby("ZONAL")["_RATIO"].mean()
     if not ratio_por_zonal.empty:
+        zonal_alta = ratio_por_zonal.idxmax()
+        lines.append(f"  - {zonal_alta}: Ratio CON-->ALT mas alto — referente del dia")
         zonal_baja = ratio_por_zonal.idxmin()
-        lines.append(f"  - {zonal_baja}: Ratio CON-->ALT mas bajo — posible problema de tecnica")
+        lines.append(f"  - {zonal_baja}: Ratio CON-->ALT mas bajo — accion urgente del supervisor")
 
     return "\n".join(lines)
 
@@ -239,7 +234,7 @@ class SupervisorAlertProcess:
         logging.info("INICIANDO PROCESO ALERTA SUPERVISORES")
         logging.info("=" * 60)
 
-        archivo = _buscar_avance(self.config["archivos_avance_dir"])
+        archivo = _buscar_avance(self.config["archivos_avance_dir"], self.config)
         if not archivo:
             logging.error("[SupervisorAlert] No se encontro archivo AVANCE_.xlsx")
             return False
@@ -263,9 +258,12 @@ class SupervisorAlertProcess:
                 continue
             texto = _resumen_supervisor(df_sup, supervisor)
             try:
-                self.wa.send_text(wa_id, texto)
-                logging.info(f"[SupervisorAlert] Alerta enviada a {supervisor}")
-                enviados += 1
+                result = self.wa.send_text(wa_id, texto)
+                if result.get("success"):
+                    logging.info(f"[SupervisorAlert] Alerta enviada a {supervisor}")
+                    enviados += 1
+                else:
+                    logging.error(f"[SupervisorAlert] Error enviando a {supervisor}: {result.get('error')}")
             except Exception as e:
                 logging.error(f"[SupervisorAlert] Error enviando a {supervisor}: {e}")
 
@@ -276,9 +274,12 @@ class SupervisorAlertProcess:
             resumen = _resumen_ejecutivo_jefes(df, fecha_str)
             if resumen:
                 try:
-                    self.wa.send_text(grupo_jefes, resumen)
-                    logging.info("[SupervisorAlert] Resumen ejecutivo enviado al grupo jefes")
-                    enviados += 1
+                    result = self.wa.send_text(grupo_jefes, resumen)
+                    if result.get("success"):
+                        logging.info("[SupervisorAlert] Resumen ejecutivo enviado al grupo jefes")
+                        enviados += 1
+                    else:
+                        logging.error(f"[SupervisorAlert] Error enviando resumen ejecutivo: {result.get('error')}")
                 except Exception as e:
                     logging.error(f"[SupervisorAlert] Error enviando resumen ejecutivo: {e}")
 

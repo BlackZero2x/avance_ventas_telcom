@@ -11,7 +11,11 @@ import glob
 from datetime import datetime, timedelta
 
 import pandas as pd
+from dotenv import load_dotenv
 from msg_utils import pick_variant
+from shared.avance_finder import buscar_avance
+
+load_dotenv()
 
 
 class ItaloProcess:
@@ -33,8 +37,11 @@ class ItaloProcess:
 
         logging.info(f"  Archivo encontrado: {os.path.basename(archivo)}")
 
-        logging.info("[2/3] Subiendo hojas MES y DIA a Google Sheets...")
-        sheet_id = self.config["italo_google_sheet_id"]
+        logging.info("[2/2] Subiendo hojas MES y DIA a Google Sheets...")
+        sheet_id = os.environ.get("ITALO_SHEET_ID") or self.config.get("italo_google_sheet_id")
+        if not sheet_id:
+            logging.error("ITALO_SHEET_ID no definido en .env")
+            return False
         ok = True
         for hoja in ["MES", "DIA"]:
             if not self._upload_sheet(archivo, hoja, sheet_id):
@@ -44,25 +51,15 @@ class ItaloProcess:
             logging.error("Fallo al subir una o mas hojas a Google Sheets")
             return False
 
-        logging.info("[3/3] Notificando a Italo por WhatsApp...")
-        mensaje = pick_variant(self.config.get("italo_message_variants"), self.config["italo_message"])
-        self.wa.send_text(self.config["italo_wa_contact"], mensaje)
-
-        logging.info("PROCESO ITALO COMPLETADO")
+        logging.info("PROCESO ITALO COMPLETADO (sin notificacion WA)")
         return True
 
     def _buscar_appventory(self):
-        directorio = self.config["archivos_avance_dir"]
-        ayer = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        nombre_esperado = os.path.join(directorio, f"AVANCE_VTAS_APPVENTORY_{ayer}.xlsx")
-        if os.path.exists(nombre_esperado):
-            return nombre_esperado
-
-        logging.error(
-            f"No se encontro AVANCE_VTAS_APPVENTORY_{ayer}.xlsx en {directorio}. "
-            f"Ejecuta AVANCE.py primero para generar el archivo del dia."
+        return buscar_avance(
+            self.config["archivos_avance_dir"],
+            self.config,
+            prefijo="AVANCE_VTAS_APPVENTORY_",
         )
-        return None
 
     def _upload_sheet(self, archivo, hoja, sheet_id):
         try:

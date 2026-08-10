@@ -5,8 +5,8 @@ Proceso JESUS:
 """
 import logging
 import os
-from datetime import datetime, timedelta
 from msg_utils import pick_variant
+from shared.avance_finder import buscar_avance
 
 
 class JesusProcess:
@@ -25,22 +25,14 @@ class JesusProcess:
 
         logging.info(f"Enviando archivo a Jesus: {os.path.basename(archivo)}")
         caption = pick_variant(self.config.get("jesus_message_variants"), self.config["jesus_message"])
-        self.wa.send_file(self.config["jesus_wa_contact"], archivo, caption=caption)
+        result = self.wa.send_file(self.config["jesus_wa_contact"], archivo, caption=caption)
 
-        logging.info("PROCESO JESUS COMPLETADO")
-        return True
+        if result.get("success"):
+            logging.info("PROCESO JESUS COMPLETADO")
+            return True
+        else:
+            logging.error(f"Error enviando a Jesus: {result.get('error', 'unknown')}")
+            return False
 
     def _buscar_avance(self):
-        directorio = self.config["archivos_avance_dir"]
-        ayer = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        nombre_esperado = os.path.join(directorio, f"AVANCE_{ayer}.xlsx")
-
-        if os.path.exists(nombre_esperado):
-            logging.info(f"Archivo encontrado: {nombre_esperado}")
-            return nombre_esperado
-
-        logging.error(
-            f"No se encontro AVANCE_{ayer}.xlsx en {directorio}. "
-            f"Ejecuta AVANCE.py primero para generar el archivo del dia."
-        )
-        return None
+        return buscar_avance(self.config["archivos_avance_dir"], self.config)

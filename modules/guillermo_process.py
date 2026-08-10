@@ -1,33 +1,24 @@
 """
-Proceso GUILLERMO — WhatsApp + correo electrónico:
-1. Buscar AVANCE_{aaaa-mm-dd}.xlsx en Archivos_Avance (fecha de ayer)
-2. Enviar el archivo por WhatsApp con mensaje personalizado
-3. Enviar el archivo por correo al destinatario definido en config["guillermo_email"]
-   Asunto: Avance de FIJA actualizado al DD-MM-YYYY
+Proceso GUILLERMO — solo WhatsApp:
+El correo a Guillermo ahora va consolidado en JefesEmailProcess junto con Carlos y Jesús.
 """
 import logging
 import os
-from datetime import datetime, timedelta
-
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "shared"))
-from gmail_helper import GmailHelper
 from msg_utils import pick_variant
 from execution_log import registrar_canal, canal_ok
-from dotenv import load_dotenv
-
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
+from avance_finder import buscar_avance
 
 
 class GuillermnoProcess:
-    def __init__(self, config, wa, gmail_service):
+    def __init__(self, config, wa, gmail_service=None):
         self.config = config
         self.wa = wa
-        self.gmail = GmailHelper(gmail_service)
 
     def execute(self):
         logging.info("=" * 50)
-        logging.info("INICIANDO PROCESO GUILLERMO (WhatsApp + email)")
+        logging.info("INICIANDO PROCESO GUILLERMO (WhatsApp)")
         logging.info("=" * 50)
 
         archivo = self._buscar_avance()
@@ -35,16 +26,8 @@ class GuillermnoProcess:
             return False
 
         ok_wa = self._enviar_whatsapp(archivo)
-        ok_mail = self._enviar_correo(archivo)
-
-        if ok_wa and ok_mail:
-            logging.info("PROCESO GUILLERMO COMPLETADO")
-        else:
-            logging.warning(
-                f"PROCESO GUILLERMO con errores — WA: {'OK' if ok_wa else 'FALLO'}, "
-                f"email: {'OK' if ok_mail else 'FALLO'}"
-            )
-        return ok_wa and ok_mail
+        logging.info("PROCESO GUILLERMO " + ("COMPLETADO" if ok_wa else "CON ERRORES"))
+        return ok_wa
 
     def _enviar_whatsapp(self, archivo):
         if canal_ok("guillermo", "wa"):
@@ -55,44 +38,15 @@ class GuillermnoProcess:
             self.config["guillermo_message"]
         )
         logging.info(f"Enviando archivo a Guillermo (WA): {os.path.basename(archivo)}")
-        self.wa.send_file(self.config["guillermo_wa_contact"], archivo, caption=caption)
-        registrar_canal("guillermo", "wa", True)
-        return True
-
-    def _enviar_correo(self, archivo):
-        destinatario = os.environ.get("GUILLERMO_EMAIL", "").strip()
-        if not destinatario:
-            logging.error("GUILLERMO_EMAIL no definido en .env — correo no enviado")
-            return False
-        ayer = (datetime.now() - timedelta(days=1)).strftime("%d-%m-%Y")
-        asunto = f"Avance de FIJA actualizado al {ayer}"
-        cuerpo = (
-            f"Buen dia,\n\n"
-            f"Adjunto el reporte de avance de ventas FIJA actualizado al {ayer}.\n\n"
-            f"Saludos."
-        )
-        if canal_ok("guillermo", "email"):
-            logging.info("Correo Guillermo ya enviado hoy — omitiendo reenvio")
+        result = self.wa.send_file(self.config["guillermo_wa_contact"], archivo, caption=caption)
+        # Verificar que wa_client retornó éxito (no solo que no tuvo excepción)
+        if result.get("success"):
+            registrar_canal("guillermo", "wa", True)
             return True
-        logging.info(f"Enviando correo a: {destinatario}")
-        ok = self.gmail.send_email_with_attachment(
-            [destinatario], asunto, cuerpo, archivo
-        )
-        if ok:
-            registrar_canal("guillermo", "email", True)
-        return ok
+        else:
+            logging.error(f"Error enviando a Guillermo por WA: {result.get('error', 'unknown')}")
+            registrar_canal("guillermo", "wa", False)
+            return False
 
     def _buscar_avance(self):
-        directorio = self.config["archivos_avance_dir"]
-        ayer = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        nombre_esperado = os.path.join(directorio, f"AVANCE_{ayer}.xlsx")
-
-        if os.path.exists(nombre_esperado):
-            logging.info(f"Archivo encontrado: {nombre_esperado}")
-            return nombre_esperado
-
-        logging.error(
-            f"No se encontro AVANCE_{ayer}.xlsx en {directorio}. "
-            f"Ejecuta AVANCE.py primero para generar el archivo del dia."
-        )
-        return None
+        return buscar_avance(self.config["archivos_avance_dir"], self.config)

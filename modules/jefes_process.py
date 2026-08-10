@@ -2,9 +2,9 @@
 Proceso JEFES (Jefe de proyecto + Jefes de zona + Gerente comercial):
 Fuente: archivo AVANCE_{fecha}.xlsx generado por AVANCE.py
 
-1. Captura TDS!B4:V15  → imagen → grupo con mensaje + menciones
-2. Captura TDS!Y4:AT17 → imagen → grupo con mensaje + menciones
-3. Enviar SEGUIMIENTO_VDD_FIJA_dd-mm-aaaa.xlsx como adjunto con mensaje + menciones
+1. Captura TDS!B4:AC15  → imagen → grupo JEFES + Jesús Ascencios por WhatsApp (8 últimos días)
+2. Captura TDS!AD4:BG14 → imagen → grupo JEFES + Jesús Ascencios por WhatsApp (8 últimos días)
+3. Enviar SEGUIMIENTO_VDD_FIJA_dd-mm-aaaa.xlsx como adjunto → grupo JEFES con mensaje + menciones
 """
 import logging
 import os
@@ -17,6 +17,8 @@ import xlwings as xw
 import win32gui
 from PIL import ImageGrab
 from msg_utils import pick_variant
+from shared.screenshot_safe import ScreenshotManager
+from shared.avance_finder import buscar_avance
 
 
 class JefesProcess:
@@ -49,16 +51,7 @@ class JefesProcess:
         return True
 
     def _buscar_avance(self):
-        directorio = self.config["archivos_avance_dir"]
-        ayer = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        nombre_esperado = os.path.join(directorio, f"AVANCE_{ayer}.xlsx")
-        if os.path.exists(nombre_esperado):
-            return nombre_esperado
-        logging.error(
-            f"No se encontro AVANCE_{ayer}.xlsx en {directorio}. "
-            f"Ejecuta AVANCE.py primero para generar el archivo del dia."
-        )
-        return None
+        return buscar_avance(self.config["archivos_avance_dir"], self.config)
 
     def _capturar_rango(self, app, wb, sheet, rango, cap_path, excel_hwnd):
         """Exporta un rango de Excel como PNG. Intenta CopyPicture+clipboard primero;
@@ -123,6 +116,10 @@ class JefesProcess:
     def _enviar_capturas(self, archivo, temp_dir, grupo):
         app = None
         wb = None
+        lock = ScreenshotManager("MOVISTAR_AVANCE_TDS")
+        if not lock.adquirir_lock(timeout=120):
+            logging.error("No se pudo adquirir lock de captura (otro proceso usa Excel). Abortando capturas.")
+            return False
         try:
             # Cerrar instancias residuales de Excel
             subprocess.run(["taskkill", "/f", "/im", "EXCEL.EXE"], capture_output=True)
@@ -175,21 +172,36 @@ class JefesProcess:
             msg_captura2 = pick_variant(self.config.get("jefes_mensaje_captura2_variants"), self.config["jefes_mensaje_captura2"])
             menciones = self.config.get("jefes_menciones") or []
 
-            for rango, cap_path, msg in [
-                (self.config["jefes_tds_rango1"], os.path.join(temp_dir, "captura_tds_1.png"), msg_captura1),
-                (self.config["jefes_tds_rango2"], os.path.join(temp_dir, "captura_tds_2.png"), msg_captura2),
+            # El primer mensaje lleva @número de cada mencionado para que WA renderice la etiqueta
+            if menciones:
+                partes = " ".join(f"@{wa_id.replace('@c.us', '')}" for wa_id in menciones)
+                msg_captura1_con_menciones = msg_captura1 + "\n" + partes
+            else:
+                msg_captura1_con_menciones = msg_captura1
+
+            jesus_contact = self.config.get("jesus_wa_contact", None)
+
+            for rango, cap_path, msg, menc in [
+                (self.config["jefes_tds_rango1"], os.path.join(temp_dir, "captura_tds_1.png"), msg_captura1_con_menciones, menciones),
+                (self.config["jefes_tds_rango2"], os.path.join(temp_dir, "captura_tds_2.png"), msg_captura2, []),
             ]:
                 logging.info(f"  Capturando TDS!{rango}...")
                 if self._capturar_rango(app, wb, sheet, rango, cap_path, excel_hwnd):
-                    # Enviar imagen primero (sin caption para no mezclar texto con menciones)
+                    # Enviar imagen al grupo JEFES (sin caption para no mezclar texto con menciones)
                     self.wa.send_image(grupo, cap_path, caption="")
                     time.sleep(5)
-                    # Enviar texto como mención real para que WhatsApp lo renderice correctamente
-                    if menciones:
-                        self.wa.send_mention(grupo, msg, menciones)
+                    # Enviar texto al grupo; el primer mensaje lleva menciones reales (@número en texto + array IDs)
+                    if menc:
+                        self.wa.send_mention(grupo, msg, menc)
                     else:
                         self.wa.send_text(grupo, msg)
                     time.sleep(12)
+
+                    # Enviar imagen a Jesús Ascencios
+                    if jesus_contact:
+                        self.wa.send_image(jesus_contact, cap_path, caption="")
+                        time.sleep(5)
+                        logging.info(f"  TDS enviada a {jesus_contact}")
                 else:
                     logging.error(f"  No se pudo capturar TDS!{rango}")
 
@@ -211,6 +223,7 @@ class JefesProcess:
                     app.quit()
                 except Exception:
                     pass
+            lock.liberar_lock()
 
     def _enviar_seguimiento(self, grupo, menciones):
         try:
@@ -233,12 +246,7 @@ class JefesProcess:
             logging.info(f"  Enviando SEGUIMIENTO: {os.path.basename(archivo)}")
 
             msg_seg = pick_variant(self.config.get("jefes_mensaje_seguimiento_variants"), self.config["jefes_mensaje_seguimiento"])
-            if menciones:
-                self.wa.send_mention(grupo, msg_seg, menciones)
-                time.sleep(10)
-                self.wa.send_file(grupo, archivo, caption="")
-            else:
-                self.wa.send_file(grupo, archivo, caption=msg_seg)
+            self.wa.send_file(grupo, archivo, caption=msg_seg)
 
             return True
 
