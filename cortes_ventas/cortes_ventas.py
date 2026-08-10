@@ -1409,7 +1409,7 @@ def main():
 
     # Conectar WhatsApp (necesario tanto para alerta como para informe)
     import json
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
         config = json.load(f)
 
     wa = WhatsAppClient(

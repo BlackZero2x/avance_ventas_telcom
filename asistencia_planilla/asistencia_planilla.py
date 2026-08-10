@@ -79,7 +79,9 @@ from googleapiclient.discovery import build
 
 BASE_DIR = Path(__file__).parent.parent  # raíz del proyecto
 sys.path.insert(0, str(BASE_DIR / "whatsapp_server"))
+sys.path.insert(0, str(BASE_DIR / "modules"))
 from wa_client import WhatsAppClient
+from shared.screenshot_safe import ScreenshotManager
 
 
 # ── Constantes ────────────────────────────────────────────────────────────────
@@ -252,6 +254,11 @@ def calcular_ausentes(df_rh: pd.DataFrame, df_asistencia: pd.DataFrame) -> str:
         logging.warning("No se pudo detectar columnas para lista de ausentes")
         return ""
 
+    # Normalizar zonales LIMA: cualquiera que comience con "LIMA" → "LIMA"
+    df["ZONAL_NORM"] = df[col_zonal].apply(
+        lambda z: "LIMA" if str(z).strip().startswith("LIMA") else str(z).strip()
+    )
+
     ausentes = df[df["ASISTIO"] == 0]
     if ausentes.empty:
         return "✅ *Todos asistieron hoy*"
@@ -260,8 +267,8 @@ def calcular_ausentes(df_rh: pd.DataFrame, df_asistencia: pd.DataFrame) -> str:
     zonal_actual = None
     sup_actual = None
 
-    for _, row in ausentes.sort_values([col_zonal] + ([col_sup] if col_sup else [])).iterrows():
-        zonal = row[col_zonal]
+    for _, row in ausentes.sort_values(["ZONAL_NORM"] + ([col_sup] if col_sup else [])).iterrows():
+        zonal = row["ZONAL_NORM"]
         sup = row[col_sup] if col_sup else None
         vend = row[col_vend]
 
@@ -295,11 +302,16 @@ def calcular_tablas(df_rh: pd.DataFrame, df_asistencia: pd.DataFrame):
         logging.error("No se encontro columna ZONAL en RH.")
         return pd.DataFrame(), pd.DataFrame()
 
+    # Normalizar zonales LIMA: cualquiera que comience con "LIMA" → "LIMA"
+    df["ZONAL_NORM"] = df[col_zonal].apply(
+        lambda z: "LIMA" if str(z).strip().startswith("LIMA") else str(z).strip()
+    )
+
     # ── Por ZONAL ─────────────────────────────────────────────────────────────
-    grp_z = df.groupby(col_zonal).agg(
+    grp_z = df.groupby("ZONAL_NORM").agg(
         PLANILLA=("DNI", "count"),
         ASISTENTES=("ASISTIO", "sum"),
-    ).reset_index().rename(columns={col_zonal: "ZONAL"})
+    ).reset_index().rename(columns={"ZONAL_NORM": "ZONAL"})
     grp_z[["PLANILLA", "ASISTENTES"]] = grp_z[["PLANILLA", "ASISTENTES"]].astype(int)
     grp_z["%ASISTENCIA"] = grp_z.apply(
         lambda r: r["ASISTENTES"] / r["PLANILLA"] * 100 if r["PLANILLA"] > 0 else 0.0,
@@ -326,10 +338,10 @@ def calcular_tablas(df_rh: pd.DataFrame, df_asistencia: pd.DataFrame):
         logging.warning("Sin columna SUPERVISOR en RH — tabla supervisores omitida.")
         return df_zonal, pd.DataFrame()
 
-    grp_s = df.groupby([col_zonal, col_sup]).agg(
+    grp_s = df.groupby(["ZONAL_NORM", col_sup]).agg(
         PLANILLA=("DNI", "count"),
         ASISTENTES=("ASISTIO", "sum"),
-    ).reset_index().rename(columns={col_zonal: "ZONAL", col_sup: "SUPERVISOR"})
+    ).reset_index().rename(columns={"ZONAL_NORM": "ZONAL", col_sup: "SUPERVISOR"})
     grp_s[["PLANILLA", "ASISTENTES"]] = grp_s[["PLANILLA", "ASISTENTES"]].astype(int)
     grp_s["%ASISTENCIA"] = grp_s.apply(
         lambda r: r["ASISTENTES"] / r["PLANILLA"] * 100 if r["PLANILLA"] > 0 else 0.0,
@@ -511,6 +523,11 @@ def generar_imagenes(trabajos: list[tuple]) -> dict:
         _generar_xlsx(df, titulo, ruta_xlsx)
         xlsx_temps.append((ruta_xlsx, ruta_png, len(df) + 2, len(df.columns)))
 
+    lock = ScreenshotManager("MOVISTAR_ASISTENCIA")
+    if not lock.adquirir_lock(timeout=120):
+        logging.error("[LOCK] No se pudo adquirir lock de captura — otro proceso usa Excel. Omitiendo capturas.")
+        return resultados
+
     app = None
     try:
         subprocess.run(["taskkill", "/f", "/im", "EXCEL.EXE"], capture_output=True)
@@ -549,6 +566,7 @@ def generar_imagenes(trabajos: list[tuple]) -> dict:
                 app.quit()
             except Exception:
                 pass
+        lock.liberar_lock()
 
     return resultados
 
@@ -627,7 +645,7 @@ def main():
     caption = _construir_caption(df_zonal, fecha_hoy)
 
     # IDs de menciones: leer desde contacts del config
-    _cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    _cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
     _contacts = _cfg.get("contacts", {})
     menciones_ids = [
         _contacts[k]

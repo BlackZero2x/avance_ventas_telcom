@@ -114,7 +114,7 @@ def _wa_client_y_config():
     """Devuelve (wa, config) listos para usar, o lanza excepcion si WA no esta disponible."""
     sys.path.insert(0, str(BASE_DIR / "whatsapp_server"))
     from wa_client import WhatsAppClient
-    with open(CONFIG_PATH, encoding="utf-8") as f:
+    with open(CONFIG_PATH, encoding="utf-8-sig") as f:
         config = json.load(f)
     wa = WhatsAppClient(
         host=config.get("wa_host", "localhost"),

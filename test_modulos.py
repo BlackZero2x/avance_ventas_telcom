@@ -38,7 +38,7 @@ logging.basicConfig(
 
 CONFIG_PATH = "C:/proyectos/AVANCE_MOVISTAR/config.json"
 
-with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
     config = json.load(f)
 
 MY_NUMBER = config.get("my_number", "")  # se toma del config de open-wa
@@ -49,7 +49,7 @@ wa = WhatsAppClient(
 
 # El numero propio viene del config de open-wa (whatsapp_server/config.json)
 WA_CONFIG_PATH = "C:/proyectos/AVANCE_MOVISTAR/whatsapp_server/config.json"
-with open(WA_CONFIG_PATH, "r", encoding="utf-8") as f:
+with open(WA_CONFIG_PATH, "r", encoding="utf-8-sig") as f:
     wa_config = json.load(f)
 MY_NUMBER = wa_config.get("my_number", "")
 
