@@ -367,14 +367,10 @@ WITH realme AS (
         t.velocidad_ba,
         t.cms_codsrv,
 		t.destinopaquete,
-        cd.dni_vendedor AS dni_vendedor_cd,
-        cx.dni_vendedor AS dni_vendedor_cx,
-        COALESCE(cd.dni_vendedor, cx.dni_vendedor) AS dnivddcnet
+        NULL AS dnivddcnet
     FROM fija_registros_totales t
         LEFT JOIN fija_altas a ON t.peticion = a.peticion
         LEFT JOIN fija_registros_unicos u ON t.peticion = u.peticion
-        LEFT JOIN [dbo].[fija_controlnet_detallado] cd ON t.peticion = cd.nro_pedido
-        LEFT JOIN [dbo].[fija_controlnet_detallado] cx ON t.cms_codsrv = cx.codigo_fe 
 WHERE a.fecha_alta is NOT NULL AND t.categoria_producto = 'ALTA'
     AND (
         (FORMAT(t.fecha_registro, 'yyyy-MM') = @periodo AND FORMAT(a.fecha_alta, 'yyyy-MM') = @periodo)
@@ -733,12 +729,13 @@ WITH realme AS (
         t.cms_codsrv,
 		t.destinopaquete,
 		t.desc_estado_peticion,
-        cd.dni_vendedor AS dni_vendedor_cd,
-        cx.dni_vendedor AS dni_vendedor_cx,
-        COALESCE(cd.dni_vendedor, cx.dni_vendedor) AS dnivddcnet
+        NULL AS dnivddcnet,
+        1 AS Flag_Registro_calc,
+        CASE WHEN u.peticion IS NOT NULL THEN 1 ELSE 0 END AS Flag_Registro_Unico_calc,
+        CASE WHEN a.peticion IS NOT NULL THEN 1 ELSE 0 END AS Flag_Alta_calc
     FROM fija_registros_totales t
-        LEFT JOIN [dbo].[fija_controlnet_detallado] cd ON t.peticion = cd.nro_pedido
-        LEFT JOIN [dbo].[fija_controlnet_detallado] cx ON t.cms_codsrv = cx.codigo_fe
+        LEFT JOIN fija_registros_unicos u ON t.peticion = u.peticion
+        LEFT JOIN fija_altas a ON t.peticion = a.peticion
 WHERE t.categoria_producto = 'ALTA' AND FORMAT(t.fecha_registro, 'yyyy-MM') = @periodo)
 
 SELECT
@@ -849,10 +846,10 @@ NULL AS GAP_ARPU,
 NULL AS Tipo_GAP,
 NULL AS Source_System,
 NULL AS Flag_Duplicado,
-NULL AS Flag_Registro,
-NULL AS Flag_Registro_Unico,
+Flag_Registro_calc AS Flag_Registro,
+Flag_Registro_Unico_calc AS Flag_Registro_Unico,
 NULL AS Flag_Venta,
-NULL AS Flag_Alta,
+Flag_Alta_calc AS Flag_Alta,
 NULL AS Flag_Web,
 NULL AS Producto_Web,
 NULL AS Canal_Web,
@@ -1077,16 +1074,24 @@ sql    = sql.replace(   "SET @periodo = '2026-05';", f"SET @periodo = '{PERIODO}
 sql_rt = sql_rt.replace("SET @periodo = '2026-05';", f"SET @periodo = '{PERIODO}';")
 
 # SQL mes anterior: misma query principal con PERIODO_ANT
-sql_ant = sql.replace(f"SET @periodo = '{PERIODO}';", f"SET @periodo = '{PERIODO_ANT}';")
+sql_ant    = sql.replace(   f"SET @periodo = '{PERIODO}';", f"SET @periodo = '{PERIODO_ANT}';")
+sql_rt_ant = sql_rt.replace(f"SET @periodo = '{PERIODO}';", f"SET @periodo = '{PERIODO_ANT}';")
 
-df        = pd.read_sql(sql,     engine)
-df_rt     = pd.read_sql(sql_rt,  engine)
-df_con    = pd.read_sql(sql_con, engine)
-df_ant    = pd.read_sql(sql_ant, engine)   # altas del mes anterior
+df        = pd.read_sql(sql,        engine)
+df_rt     = pd.read_sql(sql_rt,     engine)
+df_con    = pd.read_sql(sql_con,    engine)
+df_ant    = pd.read_sql(sql_ant,    engine)   # altas del mes anterior
+df_rt_ant = pd.read_sql(sql_rt_ant, engine)   # RT del mes anterior (hoja MOVISTAR)
 
 # ── Google Sheets: VENTORY y RH ────────────────────────────────
 URL_VENTORY = os.environ.get("URL_VENTORY", "https://docs.google.com/spreadsheets/d/e/2PACX-1vSXxqrGGs4_mU4n511v3zBkKo4buAFv0TwrlrrX4XD2jFjIT7cC8kvH7ER32Ye2hiOpo3mAFsUkyydg/pub?gid=22270598&single=true&output=csv")
-URL_RH      = os.environ.get("URL_RH",      "https://docs.google.com/spreadsheets/d/e/2PACX-1vSXxqrGGs4_mU4n511v3zBkKo4buAFv0TwrlrrX4XD2jFjIT7cC8kvH7ER32Ye2hiOpo3mAFsUkyydg/pub?gid=241856834&single=true&output=csv")
+
+SHEET_ID_RH     = os.environ.get("SHEET_ID_RH")
+SHEET_ID_RH_GID = os.environ.get("SHEET_ID_RH_GID")
+if not SHEET_ID_RH or not SHEET_ID_RH_GID:
+    raise RuntimeError("Faltan SHEET_ID_RH / SHEET_ID_RH_GID en .env (fuente RH BaseFija/MiniMatriz)")
+URL_RH = f"https://docs.google.com/spreadsheets/d/{SHEET_ID_RH}/export?format=csv&gid={SHEET_ID_RH_GID}"
+
 def _read_gsheet_csv(url):
     """Lee un CSV publicado de Google Sheets forzando UTF-8 (el header HTTP reporta ISO-8859-1 incorrectamente)."""
     resp = requests.get(url, timeout=60)
@@ -1100,40 +1105,40 @@ ventory = ventory.rename(columns={
 })
 rh      = _read_gsheet_csv(URL_RH)
 rh["ESQUEMA"] = rh["ESQUEMA"].replace("PART-TIME", "PLANILLA")
-# ── MiFibra: tabla SQL [dbo].[mifibra_ventas] (misma base eAuren) ──
+# ── MiFibra: tabla SQL [dbo].[mifibra_ventas_hora] (misma base eAuren) ──
+# Histórico versionado por contrato: es_actual=1 = versión vigente de cada numcontrato.
 _MF_SQL_RENAME = {
-    "numero_contrato":            "NUMERO CONTRATO",
-    "num_doc":                    "NUM DOC",
-    "estado_orden_servicio_2":    "ESTADO ORDEN SERVICIO 2",
-    "estado_ficha_contrato":      "ESTADO FICHA CONTRATO",
-    "motivo_de_observacion":      "MOTIVO DE OBSERVACION",
-    "motivo_desaprobacion":       "MOTIVO DESAPROBACION",
-    "vendedor":                   "VENDEDOR",
-    "paquete_inicial":            "PAQUETE INICIAL",
-    "plan_final":                 "PLAN FINAL",
-    "fecha_de_venta":             "FECHA DE VENTA",
-    "fecha_de_instalacion":       "FECHA DE INSTALACION",
-    "ano_reg":                    "AÑO_REG",
-    "mes_reg":                    "MES_REG",
-    "filial":                     "FILIAL",
-    "consolidado_cnt":            "CONSOLIDADO CNT",
-    "aplica":                     "APLICA",
-    "porta":                      "PORTA",
-    "categoria":                  "CATEGORIA",
-    "motivo_de_anulacion":        "MOTIVO DE ANULACION",
-    "estado_servicio_internet":   "ESTADO SERVICIO INTERNET",
-    "fecha_corte_definitivo":     "FECHA CORTE DEFINITIVO",
-    "paquete_inicial_ott":        "PAQUETE INICIAL OTT",
+    "numcontrato":            "NUMERO CONTRATO",
+    "numdocidentidad":        "NUM DOC",
+    "estadofichacontrato":    "ESTADO FICHA CONTRATO",
+    "motivo_de_observacion":  "MOTIVO DE OBSERVACION",
+    "motivodesaprobacion":    "MOTIVO DESAPROBACION",
+    "vendedor":               "VENDEDOR",
+    "paqueteinicialinternet": "PLAN FINAL",
+    "fechainscripcionficha":  "FECHA DE VENTA",
+    "fechainstinternet":      "FECHA DE INSTALACION",
+    "filial":                 "FILIAL",
+    "porta":                  "PORTA",
+    "categoria":              "CATEGORIA",
+    "motivo_de_anulacion":    "MOTIVO DE ANULACION",
+    "paqueteinicialott":      "PAQUETE INICIAL OTT",
 }
-_mf_raw = pd.read_sql("SELECT * FROM [dbo].[mifibra_ventas]", engine)
+_mf_raw = pd.read_sql(
+    "SELECT * FROM [dbo].[mifibra_ventas_hora] WHERE es_actual = 1", engine
+)
 _mf_raw = _mf_raw.rename(columns=_MF_SQL_RENAME)
-_mf_raw["MES_REG"] = pd.to_numeric(_mf_raw["MES_REG"], errors="coerce").astype("Int64")
-_mf_raw["AÑO_REG"] = pd.to_numeric(_mf_raw["AÑO_REG"], errors="coerce").astype("Int64")
+_mf_raw["FECHA DE VENTA"]        = pd.to_datetime(_mf_raw["FECHA DE VENTA"],        errors="coerce")
+_mf_raw["FECHA DE INSTALACION"]  = pd.to_datetime(_mf_raw["FECHA DE INSTALACION"],  errors="coerce")
+_mf_raw["MES_REG"] = _mf_raw["FECHA DE VENTA"].dt.month.astype("Int64")
+_mf_raw["AÑO_REG"] = _mf_raw["FECHA DE VENTA"].dt.year.astype("Int64")
 _mf_raw["FILIAL"] = _mf_raw["FILIAL"].str.upper().str.strip()
 _mf_raw.loc[_mf_raw["FILIAL"].str.contains("ANCASH",      na=False), "FILIAL"] = "CHIMBOTE"
 _mf_raw.loc[_mf_raw["FILIAL"].str.contains("LA LIBERTAD", na=False), "FILIAL"] = "TRUJILLO"
-mf = _mf_raw[_mf_raw["ESTADO ORDEN SERVICIO 2"].str.strip() == "LIQUIDADA"].copy()
-mf_ventas = _mf_raw.copy()   # todas las filas sin filtro de estado
+
+# VENTAS: filtro de negocio = FECHA DE VENTA (fechainscripcionficha) = mes actual
+mf_ventas = _mf_raw.copy()
+# INSTALADAS: solo fichas con instalación efectiva (FECHA DE INSTALACION no nula)
+mf = _mf_raw[_mf_raw["FECHA DE INSTALACION"].notna()].copy()
 
 engine.dispose()
 
@@ -1319,19 +1324,35 @@ df["SUP_CNET"]       = (df["SUPERVISOR"]
 df["SUP1"]           = ""
 
 # ══════════════════════════════════════════════════════════════
-# 7. JOIN LCF → RIESG
+# 7. JOIN INTEGRATEL (ORDER_KEY) → RIESG
+#    Excel enviado por correo (eduardo.pinco@integratel.com.pe), descargado
+#    previamente por main_v2.py / run_modulo.py a integratel_riesgo.xlsx.
+#    RIESG = 1 si peticion aparece en ORDER_KEY, 0 si no.
 # ══════════════════════════════════════════════════════════════
 
-URL_LCF = os.environ.get("URL_LCF", "https://docs.google.com/spreadsheets/d/e/2PACX-1vR_9W58TW-lTrt6_sb4bSgWKkfdcYGV0KXjxKwps0l3qOLGz3MR_eA27hnbAFmBegu85U9jzG5yqe9v/pub?gid=1443303762&single=true&output=csv")
+def _normalizar_clave_num(serie):
+    """Normaliza una serie a texto numérico comparable: quita espacios,
+    decimales '.0' sobrantes (Excel a veces guarda enteros como float-texto)
+    y ceros a la izquierda, para que ORDER_KEY (texto) y peticion (entero)
+    puedan compararse sin importar el formato de origen."""
+    s = serie.astype(str).str.strip()
+    s = s.str.replace(r"\.0+$", "", regex=True)   # "123456.0" -> "123456"
+    s = s.str.lstrip("0")                          # ceros a la izquierda
+    s = s.replace("", pd.NA)
+    return s
 
-lcf = _read_gsheet_csv(URL_LCF)
-lcf["PETICION"] = pd.to_numeric(lcf["PETICION"], errors="coerce").astype("Int64")
+_INTEGRATEL_PATH = Path(__file__).parent / "integratel_riesgo.xlsx"
+if _INTEGRATEL_PATH.exists():
+    integratel = pd.read_excel(_INTEGRATEL_PATH)
+    integratel_peticiones = _normalizar_clave_num(integratel["ORDER_KEY"]).dropna().unique()
+else:
+    print(f"AVISO: {_INTEGRATEL_PATH.name} no encontrado — RIESG sera 0 para todos")
+    integratel_peticiones = pd.array([], dtype="object")
 
-df = df.merge(
-    lcf[["PETICION", "[Q]"]].rename(columns={"PETICION": "peticion", "[Q]": "RIESG"}),
-    on="peticion", how="left"
-)
-df["RIESG"] = df["RIESG"].fillna(0).astype(int)
+_peticion_norm_df = _normalizar_clave_num(df["peticion"])
+df["RIESG"] = _peticion_norm_df.isin(integratel_peticiones).astype(int)
+print(f"[OK] Integratel: {len(integratel_peticiones)} ORDER_KEY cargados, "
+      f"{int(df['RIESG'].sum())} coincidencias en ALTAS del periodo")
 
 # ══════════════════════════════════════════════════════════════
 # 8. LIMPIEZA FINAL
@@ -1394,11 +1415,26 @@ df_rt["SUP_CNET"]       = (df_rt["SUPERVISOR"]
                            .str.translate(str.maketrans("ÁÉÍÓÚ", "AEIOU")))
 df_rt["SUP1"]           = ""
 
-# RIESG = 0 para todos (RT no pasa por LCF)
-df_rt["RIESG"] = 0
+# Join Integratel (ORDER_KEY) → RIESG
+df_rt["RIESG"] = _normalizar_clave_num(df_rt["peticion"]).isin(integratel_peticiones).astype(int)
 
 # Limpieza final
 df_rt["DESTINOPAQUETE"] = df_rt["DESTINOPAQUETE"].fillna("-")
+
+# ── df_rt_ant: RT del mes anterior — solo lo necesario para hoja MOVISTAR ──
+# (zonal vía RH + Fecha_Registro + Q; no requiere el join VENTORY completo)
+df_rt_ant = df_rt_ant.drop_duplicates(subset="peticion")
+df_rt_ant["Fecha_Registro"] = pd.to_datetime(df_rt_ant["Fecha_Registro"], errors="coerce")
+df_rt_ant["DNI_ORIG"] = pd.to_numeric(df_rt_ant["DNI_ORIG"], errors="coerce").astype("Int64")
+df_rt_ant["peticion"] = pd.to_numeric(df_rt_ant["peticion"], errors="coerce").astype("Int64")
+df_rt_ant["FE"]       = df_rt_ant["FE"].astype(str).str.strip()
+df_rt_ant = df_rt_ant.merge(ventory_por_fe,  on="FE",      how="left")
+df_rt_ant = df_rt_ant.merge(ventory_por_pet, on="peticion", how="left")
+df_rt_ant["dnivdd_final"] = df_rt_ant["v1_dnivdd"].combine_first(df_rt_ant["v2_dnivdd"])
+df_rt_ant = df_rt_ant.drop(columns=["v1_dnivdd", "v2_dnivdd"])
+df_rt_ant = df_rt_ant.merge(rh_slim, on="dnivdd_final", how="left")
+df_rt_ant["DNI_CNET"] = df_rt_ant["dnivdd_final"]
+df_rt_ant = df_rt_ant.rename(columns={"RH.ZONAL": "ZONAL"})
 
 # ══════════════════════════════════════════════════════════════
 # 9. CONSTRUCCIÓN DE TABLAS Y EXPORTACIÓN MULTI-HOJA
@@ -1447,6 +1483,7 @@ FERIADOS_PERU = [
     pd.Timestamp("2026-06-29"),  # San Pedro y San Pablo
     pd.Timestamp("2026-07-28"),  # Fiestas Patrias
     pd.Timestamp("2026-07-29"),  # Fiestas Patrias
+    pd.Timestamp("2026-08-06"),  # Feriado (declarado)
     pd.Timestamp("2026-08-30"),  # Santa Rosa de Lima
     pd.Timestamp("2026-10-08"),  # Combate de Angamos
     pd.Timestamp("2026-11-01"),  # Todos los Santos
@@ -1492,13 +1529,16 @@ if f_ing_col:
 else:
     rh_norm["F_INGRESO"] = pd.NaT
 rh_norm.rename(columns={zona_col: "ZONAL"}, inplace=True)
+rh_norm.loc[rh_norm["ZONAL"].str.startswith("LIMA", na=False), "ZONAL"] = "LIMA"
 
-# ── Base de vendedores: ACTIVO + EN CAMPO ─────────────────────
+# ── Base de vendedores: ACTIVO + EN CAMPO + OPERADOR MOVISTAR ──
 _mask = pd.Series([True] * len(rh_norm), index=rh_norm.index)
 if "ESTADO" in rh_norm.columns:
     _mask &= rh_norm["ESTADO"].str.upper().str.strip() == "ACTIVO"
 if "feedback_rh" in rh_norm.columns:
     _mask &= rh_norm["feedback_rh"].str.upper().str.strip() == "EN CAMPO"
+if "OPERADOR" in rh_norm.columns:
+    _mask &= rh_norm["OPERADOR"].str.upper().str.strip() == "MOVISTAR"
 
 rh_base = (
     rh_norm[_mask][["ZONAL", "SUPERVISOR", "DNI", "VENDEDOR", "ESQUEMA", "F_INGRESO"]]
@@ -1637,12 +1677,8 @@ df_ant["TV"]              = df_ant["sub_producto"].apply(
                                 lambda x: "TV" if x in tv_productos else "BA")
 df_ant["PilotoPR+MONOBA"] = (df_ant["Scoring"] == "FLEX").astype(int)
 
-# Join LCF → RIESG
-df_ant = df_ant.merge(
-    lcf[["PETICION", "[Q]"]].rename(columns={"PETICION": "peticion", "[Q]": "RIESG"}),
-    on="peticion", how="left"
-)
-df_ant["RIESG"] = df_ant["RIESG"].fillna(0).astype(int)
+# Join Integratel (ORDER_KEY) → RIESG
+df_ant["RIESG"] = _normalizar_clave_num(df_ant["peticion"]).isin(integratel_peticiones).astype(int)
 df_ant["DESTINOPAQUETE"] = df_ant["DESTINOPAQUETE"].fillna("-")
 
 # Construir altas_ant_df con el mismo orden de columnas
@@ -1819,10 +1855,12 @@ vdd1["ALTAS_M-2"]     = vdd1["ALTAS_M-2"].fillna(0).astype(int)
 vdd1["ALTAS.MF"]      = vdd1["ALTAS.MF"].fillna(0).astype(int)
 vdd1["OBSERVACIONES"] = ""
 
+vdd1["Crece/Decrece"] = ""   # placeholder; se reemplaza con fórmula Excel al exportar
+
 vdd1_final = vdd1[[
     "ZONAL", "SUPERVISOR", "DNI", "VENDEDOR", "ANTIG", "F_INGRESO", "ESQUEMA",
     "ALTAS", "AXB/FXS", "ALTAS_NETAS", "CLUSTER.ALTAS", "REG_TOT", "%Conver", "RATIO_CON",
-    "PROYECT.ALT", "CUOTA", "PROY_VS_CUOTA", "ALTAS_M-1", "ALTAS_M-2", "ALTAS.MF",
+    "PROYECT.ALT", "CUOTA", "PROY_VS_CUOTA", "Crece/Decrece", "ALTAS_M-1", "ALTAS_M-2", "ALTAS.MF",
     "OBSERVACIONES"
 ]].sort_values(["ZONAL", "SUPERVISOR", "VENDEDOR"]).reset_index(drop=True)
 
@@ -2668,7 +2706,8 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
     # Columnas: ZONAL(1) SUPERVISOR(2) DNI(3) VENDEDOR(4) ANTIG(5) F_INGRESO(6)
     #           ESQUEMA(7) ALTAS(8) AXB/FXS(9) ALTAS_NETAS(10) CLUSTER.ALTAS(11)
     #           REG_TOT(12) %Conver(13) RATIO_CON(14) PROYECT.ALT(15) CUOTA(16)
-    #           PROY_VS_CUOTA(17) ALTAS_M-1(18) ALTAS_M-2(19) ALTAS.MF(20) OBSERVACIONES(21)
+    #           PROY_VS_CUOTA(17) Crece/Decrece(18) ALTAS_M-1(19) ALTAS_M-2(20)
+    #           ALTAS.MF(21) OBSERVACIONES(22)
     _V1_HDR = {
         # col: (fgColor, font_color)
         1:  ("4472C4", "FFFFFF"),   # ZONAL          — azul
@@ -2688,10 +2727,11 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
         15: ("4472C4", "FFFFFF"),   # PROYECT.ALT     — azul
         16: ("0F9ED5", "FFFFFF"),   # CUOTA            — azul claro
         17: ("4472C4", "FFFFFF"),   # PROY_VS_CUOTA   — azul
-        18: ("0F9ED5", "FFFFFF"),   # ALTAS_M-1        — azul claro
-        19: ("0F9ED5", "FFFFFF"),   # ALTAS_M-2        — azul claro
-        20: ("A02B93", "FFFFFF"),   # ALTAS.MF         — morado
-        21: ("FFFF00", "000000"),   # OBSERVACIONES    — amarillo, fuente negra
+        18: ("196B24", "FFFFFF"),   # Crece/Decrece    — verde oscuro
+        19: ("0F9ED5", "FFFFFF"),   # ALTAS_M-1        — azul claro
+        20: ("0F9ED5", "FFFFFF"),   # ALTAS_M-2        — azul claro
+        21: ("A02B93", "FFFFFF"),   # ALTAS.MF         — morado
+        22: ("FFFF00", "000000"),   # OBSERVACIONES    — amarillo, fuente negra
     }
     # Bandas de datos: filas pares/impares con azul pastel (calculado desde theme accent1 #4472C4)
     _V1_ROW_EVEN = "B4C6E7"   # tint ~0.60
@@ -2700,8 +2740,8 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
     _V1_COL_WIDTHS = {
         1: 11.71, 2: 30.71, 3: 9.0,  4: 40.14, 5: 15.71, 6: 14.29,
         7: 13.43, 8: 10.29, 9: 12.14, 10: 16.0, 11: 17.71, 12: 12.43,
-        13: 12.43, 14: 14.57, 15: 16.0, 16: 11.0, 17: 18.71, 18: 14.0,
-        19: 14.0,  20: 15.14, 21: 19.0,
+        13: 12.43, 14: 14.57, 15: 16.0, 16: 11.0, 17: 18.71, 18: 16.0,
+        19: 14.0,  20: 14.0,  21: 15.14, 22: 19.0,
     }
 
     # Aplicar encabezados (fila 1)
@@ -2737,14 +2777,19 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
     _col_dni       = get_column_letter(3)   # C = DNI
     _col_alt_netas = get_column_letter(10)  # J = ALTAS_NETAS
     _col_reg_tot   = get_column_letter(12)  # L = REG_TOT
+    _col_altas     = get_column_letter(8)   # H = ALTAS
+    _col_altas_m1  = get_column_letter(19)  # S = ALTAS_M-1
     for data_row in range(2, nrows + 2):
         an  = f"{_col_alt_netas}{data_row}"
         rt  = f"{_col_reg_tot}{data_row}"
         dni = f"{_col_dni}{data_row}"
+        h   = f"{_col_altas}{data_row}"
+        s   = f"{_col_altas_m1}{data_row}"
         ws_v1.cell(row=data_row, column=13).value         = f"=IFERROR(IF(({an}/{rt})>=1,1,({an}/{rt})),0)"
         ws_v1.cell(row=data_row, column=13).number_format = _PCT_FMT
         ws_v1.cell(row=data_row, column=14).value         = f"=IFERROR(SUMIF(CON[DNIVDD],{dni},CON[Q])/TDS!$B$18,0)"
         ws_v1.cell(row=data_row, column=14).number_format = _DEC1_FMT
+        ws_v1.cell(row=data_row, column=18).value         = f'=IF({h}>{s},"Crece",IF({s}>{h},"Decrece","Se Mantiene"))'
 
     # Formato condicional: AXB/FXS (col I) = 0 → rojo/rosa
     ws_v1.conditional_formatting.add(
@@ -2789,8 +2834,10 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
     _MF_FILIALES = ["AREQUIPA", "CHIMBOTE", "LIMA", "TRUJILLO"]
     _DIAS_ES = {0:"lun",1:"mar",2:"mié",3:"jue",4:"vie",5:"sáb",6:"dom"}
 
-    def _preparar_pivot_dia(df_src, col_fecha="FECHA DE VENTA"):
-        """Pivot filas=día, cols=filiales fijas, + fila Total general."""
+    def _preparar_pivot_dia(df_src, col_fecha="FECHA DE VENTA", dias_completos=None):
+        """Pivot filas=día, cols=filiales fijas, + fila Total general.
+        Si dias_completos (lista de ints) se pasa, garantiza una fila por cada
+        día de esa lista aunque no tenga datos (rellena con 0)."""
         work = df_src.copy()
         work["_fecha"] = pd.to_datetime(
             work[col_fecha], dayfirst=True, errors="coerce"
@@ -2803,22 +2850,40 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
 
         if work.empty:
             piv = pd.DataFrame(columns=["FECHA"] + _MF_FILIALES + ["Total general"])
-            tot = pd.DataFrame([["Total general"] + [0]*len(_MF_FILIALES) + [0]],
-                               columns=piv.columns)
-            return pd.concat([piv, tot], ignore_index=True)
+        else:
+            piv = work.pivot_table(
+                index=["_dia_orden", "_dia_label"], columns="FILIAL",
+                values="Q", aggfunc="count", fill_value=0
+            ).reset_index()
+            piv.columns.name = None
+            piv = piv.drop(columns="_dia_orden").rename(columns={"_dia_label": "FECHA"})
 
-        piv = work.pivot_table(
-            index=["_dia_orden", "_dia_label"], columns="FILIAL",
-            values="Q", aggfunc="count", fill_value=0
-        ).reset_index()
-        piv.columns.name = None
-        piv = piv.drop(columns="_dia_orden").rename(columns={"_dia_label": "FECHA"})
+            # Garantizar columnas fijas (rellenar 0 si la filial no tuvo datos)
+            for _fc in _MF_FILIALES:
+                if _fc not in piv.columns:
+                    piv[_fc] = 0
+            piv = piv[["FECHA"] + _MF_FILIALES]
 
-        # Garantizar columnas fijas (rellenar 0 si la filial no tuvo datos)
-        for _fc in _MF_FILIALES:
-            if _fc not in piv.columns:
-                piv[_fc] = 0
-        piv = piv[["FECHA"] + _MF_FILIALES]
+        if dias_completos:
+            _dias_faltantes = set(dias_completos) - set(
+                pd.to_datetime(work.loc[work["_dia_orden"].notna(), "_fecha"]).dt.day
+            )
+            if _dias_faltantes:
+                _rel = {d.day: d for d in pd.date_range(inicio_mes, fin_mes)}
+                _faltan_rows = pd.DataFrame([
+                    {"FECHA": f"{_DIAS_ES[_rel[d].weekday()]} {d:02d}",
+                     **{fc: 0 for fc in _MF_FILIALES}}
+                    for d in sorted(_dias_faltantes) if d in _rel
+                ])
+                piv = pd.concat([piv, _faltan_rows], ignore_index=True)
+                piv["_orden"] = piv["FECHA"].str.extract(r"(\d+)").astype(int)
+                piv = piv.sort_values("_orden").drop(columns="_orden").reset_index(drop=True)
+
+        if piv.empty:
+            piv = pd.DataFrame([["Total general"] + [0]*len(_MF_FILIALES)],
+                               columns=["FECHA"] + _MF_FILIALES)
+            piv["Total general"] = 0
+            return piv
 
         # Fila Total general
         tot_vals = {c: piv[c].sum() for c in _MF_FILIALES}
@@ -2889,7 +2954,11 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
 
     # ── Construir datos ───────────────────────────────────────────────────
     # VENTAS: todos los registros del mes, agrupados por FECHA DE VENTA
-    _piv_ventas = _preparar_pivot_dia(mf_filt_ventas, col_fecha="FECHA DE VENTA")
+    # Se completan todos los días transcurridos del mes (hasta ayer), aunque
+    # algún día no tenga ventas registradas, para que no falten filas.
+    _dias_transcurridos = list(range(1, min(ayer_ts, fin_mes).day + 1))
+    _piv_ventas = _preparar_pivot_dia(mf_filt_ventas, col_fecha="FECHA DE VENTA",
+                                       dias_completos=_dias_transcurridos)
     # INSTALADAS: solo LIQUIDADAS del mes, agrupados por FECHA DE INSTALACION
     _piv_inst   = _preparar_pivot_dia(mf_filt,        col_fecha="FECHA DE INSTALACION")
 
@@ -3002,9 +3071,8 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
         return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
 
     # Colores originales
-    _MOV_YEL   = "FFD166"  # fondo amarillo dorado — zonales fila 1
-    _MOV_DKBL  = "0B3866"  # fuente azul oscuro — texto zonales fila 1
-    _MOV_CONV  = "002060"  # fuente azul oscuro — %CONV.
+    _MOV_YEL   = "FFD166"  # fondo amarillo dorado — zonales fila título
+    _MOV_DKBL  = "0B3866"  # fuente azul oscuro — texto zonales fila título
     _MOV_HDR2_BG = "156082"; _MOV_HDR2_FG = "FFFFFF"  # fila 2: azul + blanco
     _MOV_B2_BG   = "156082"; _MOV_B2_FG   = "FFFFFF"  # bloques 2: azul + blanco
     _MOV_B3_BG   = "156082"; _MOV_B3_FG   = "FFFFFF"  # bloques 3: azul + blanco
@@ -3014,17 +3082,32 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
     _MOV_ZONALES = sorted(_tds_zonales)   # ['AREQUIPA','CHIMBOTE','ILO','NORTE CHICO','TACNA','TRUJILLO']
     _NZ = len(_MOV_ZONALES)
 
-    # Inicio del período y mes anterior
+    # ── Período actual y mes anterior ──────────────────────────────────────
     _mov_inicio = pd.Timestamp(f"{PERIODO}-01")
     _mov_fin    = _mov_inicio + pd.offsets.MonthEnd(0)
-    _dias_mes   = pd.date_range(_mov_inicio, _mov_fin, freq="D")
-    _dias_labels = [d.strftime("%a %d").lower().replace("mon","lun").replace("tue","mar")\
-                    .replace("wed","mié").replace("thu","jue").replace("fri","vie")\
-                    .replace("sat","sáb").replace("sun","dom") for d in _dias_mes]
 
     _mov_ant_inicio = _mov_inicio - pd.offsets.MonthBegin(1)
-    _mov_ant_fin    = _mov_inicio - pd.timedelta_range(start="1 day", periods=1)[0]
-    _dias_ant       = pd.date_range(_mov_ant_inicio, _mov_ant_fin, freq="D")
+    _mov_ant_fin    = _mov_ant_inicio + pd.offsets.MonthEnd(0)
+
+    # Último día del mes actual con dato real (_f_max ya calculado en sección 8/9
+    # para PROYECT.ALT); si no hay altas en el período, usar el inicio de mes.
+    _mov_ultimo_dia = pd.Timestamp(_f_max).normalize() if len(_fechas_alta) > 0 else _mov_inicio
+    _mov_ultimo_dia = min(max(_mov_ultimo_dia, _mov_inicio), _mov_fin)
+    _mov_n_dias     = (_mov_ultimo_dia - _mov_inicio).days + 1   # días transcurridos del mes actual
+
+    # Truncar ambos meses al mismo número de días transcurridos (comparación pareja)
+    _dias_mes = pd.date_range(_mov_inicio, _mov_ultimo_dia, freq="D")
+
+    _mov_ant_ultimo_dia = min(_mov_ant_inicio + pd.Timedelta(days=_mov_n_dias-1), _mov_ant_fin)
+    _dias_ant = pd.date_range(_mov_ant_inicio, _mov_ant_ultimo_dia, freq="D")
+
+    def _fmt_dia_labels(dias):
+        return [d.strftime("%a %d").lower().replace("mon","lun").replace("tue","mar")\
+                 .replace("wed","mié").replace("thu","jue").replace("fri","vie")\
+                 .replace("sat","sáb").replace("sun","dom") for d in dias]
+
+    _dias_labels     = _fmt_dia_labels(_dias_mes)
+    _dias_ant_labels = _fmt_dia_labels(_dias_ant)
 
     # ── Preparar datos base ───────────────────────────────────────────────
     # altas_df y rt_df ya están en scope
@@ -3041,16 +3124,26 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
     _altas["_fa"]  = pd.to_datetime(_altas["Fecha_Alta"],     errors="coerce").dt.normalize()
     _rt["_fr"]     = pd.to_datetime(_rt["Fecha_Registro"],    errors="coerce").dt.normalize()
 
-    # Filtros mes actual (RIESG==0)
-    _altas_mes  = _altas[(_altas["_fa"] >= _mov_inicio) & (_altas["_fa"] <= _mov_fin) & (_altas["RIESG"] == 0)]
-    _rt_mes     = _rt[   (_rt["_fr"]   >= _mov_inicio) & (_rt["_fr"]   <= _mov_fin)   & (_rt["RIESG"]   == 0)]
+    # Filtros mes actual (RIESG==0), ya truncado al último día con dato
+    _altas_mes  = _altas[(_altas["_fa"] >= _mov_inicio) & (_altas["_fa"] <= _mov_ultimo_dia) & (_altas["RIESG"] == 0)]
+    _rt_mes     = _rt[   (_rt["_fr"]   >= _mov_inicio) & (_rt["_fr"]   <= _mov_ultimo_dia)   & (_rt["RIESG"]   == 0)]
 
-    # Mes anterior: usar altas_ant_df (datos SQL con PERIODO_ANT), RIESG==0
+    # Mes anterior: altas_ant_df (datos SQL con PERIODO_ANT), RIESG==0, truncado al mismo Nº de días
     _altas_ant_raw = altas_ant_df.copy()
     _altas_ant_raw["_fa"] = pd.to_datetime(_altas_ant_raw["Fecha_Alta"], errors="coerce").dt.normalize()
     _altas_ant_raw["zonal2"] = _altas_ant_raw["zonal"].apply(
         lambda z: "LIMA" if str(z).upper().startswith("LIMA") else z)
-    _altas_ant = _altas_ant_raw[_altas_ant_raw["RIESG"] == 0]
+    _altas_ant = _altas_ant_raw[
+        (_altas_ant_raw["RIESG"] == 0)
+        & (_altas_ant_raw["_fa"] >= _mov_ant_inicio) & (_altas_ant_raw["_fa"] <= _mov_ant_ultimo_dia)
+    ]
+
+    # RT mes anterior: df_rt_ant (misma query sql_rt con PERIODO_ANT), truncado
+    _rt_ant = df_rt_ant.copy()
+    _rt_ant["zonal2"] = _rt_ant["ZONAL"].apply(
+        lambda z: "LIMA" if str(z).upper().startswith("LIMA") else z)
+    _rt_ant["_fr"] = pd.to_datetime(_rt_ant["Fecha_Registro"], errors="coerce").dt.normalize()
+    _rt_ant = _rt_ant[(_rt_ant["_fr"] >= _mov_ant_inicio) & (_rt_ant["_fr"] <= _mov_ant_ultimo_dia)]
 
     # ── Función: pivot diario por zonal ───────────────────────────────────
     def _pivot_dia_zon(df, date_col, val_col, agg, dias, zonales, filtro=None):
@@ -3066,345 +3159,249 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
         _piv = _piv.reindex(index=dias, columns=zonales, fill_value=0)
         return _piv
 
-    # ── Función genérica de escritura de bloque ───────────────────────────
-    def _write_mov_block(ws, r_start, c_start, dias, dias_labels, zon_list,
-                         data_cols, col_headers, row_total, row_label="Total",
-                         hdr_fill="156082", extra_rows=None):
-        """
-        Escribe un bloque con:
-          col 0: Fecha/DIA
-          col 1..N: una columna por cada item en col_headers
-          col N+1: Total general
-        data_cols: lista de pd.Series o arrays alineados con dias (una por col_header)
-        extra_rows: lista de (label, [val_por_col, ...]) para filas adicionales debajo de Total
-        Retorna fila siguiente al último escrito.
-        """
-        _nc = len(col_headers)
-        c0  = c_start
-
-        # Encabezado
-        _hdr_cells = ["Fecha"] + list(col_headers) + ["Total general"]
-        for ci, hdr in enumerate(_hdr_cells):
-            cell = ws.cell(row=r_start, column=c0+ci, value=hdr)
-            cell.fill      = _mfill(hdr_fill)
-            cell.font      = _mfont(bold=True, color="FFFFFF")
-            cell.alignment = _maln("center")
-            cell.border    = _mall_bdr()
-        r = r_start + 1
-
-        # Filas de datos
-        for di, (dia, lbl) in enumerate(zip(dias, dias_labels)):
-            vals = [int(dc.iloc[di]) if hasattr(dc,"iloc") else int(dc[di]) for dc in data_cols]
-            row_data = [lbl] + vals + [sum(vals)]
-            for ci, v in enumerate(row_data):
-                cell = ws.cell(row=r, column=c0+ci, value=v)
-                cell.font      = _mfont()
-                cell.alignment = _maln("center" if ci > 0 else "left")
-                cell.border    = _mall_bdr()
-                if ci == 0:
-                    cell.number_format = "@"
-            r += 1
-
-        # Fila Total
-        tot_vals = [int(dc.sum()) if hasattr(dc,"sum") else sum(dc) for dc in data_cols]
-        tot_row  = [row_label] + tot_vals + [sum(tot_vals)]
-        for ci, v in enumerate(tot_row):
-            cell = ws.cell(row=r, column=c0+ci, value=v)
-            cell.font      = _mfont(bold=True)
-            cell.alignment = _maln("center" if ci > 0 else "left")
-            cell.border    = _mall_bdr()
-        r_total_row = r
-        r += 1
-
-        # Filas extra (Proyectado, Cuota, %Avance…)
-        if extra_rows:
-            for (ex_label, ex_vals) in extra_rows:
-                ex_row = [ex_label] + list(ex_vals) + [sum(v for v in ex_vals if isinstance(v,(int,float)))]
-                for ci, v in enumerate(ex_row):
-                    cell = ws.cell(row=r, column=c0+ci, value=v)
-                    cell.font      = _mfont(bold=(ci==0))
-                    cell.alignment = _maln("center" if ci > 0 else "left")
-                    cell.border    = _mall_bdr()
-                r += 1
-
-        return r, r_total_row
-
     # ════════════════════════════════════════════════════════════════
-    # BLOQUE 1 — CONVERSIÓN (REG_TOT / ALTAS / %CONV. por día/zonal)
-    # Fila 1: encabezados de ZONAL (cada grupo ocupa 3 cols: REG/ALT/%)
-    # Fila 2: sub-encabezados REG_TOT / ALTAS / %CONV.
-    # Filas 3+: datos diarios
-    # Fila Total: sumas + %conv total
+    # BLOQUE 1 — CONVERSIÓN (REG_TOT / ALTAS por día/zonal, sin %CONV.)
+    # Se repite dos veces: mes actual (arriba) y mes anterior (debajo),
+    # ambos truncados al mismo número de días transcurridos.
+    # Tabla lateral T:W — comparativo "AL <fecha>" actual vs anterior + %Variación.
     # ════════════════════════════════════════════════════════════════
 
-    # Pivots diarios
-    _reg_piv   = _pivot_dia_zon(_rt,    "_fr", "Q",           "sum",     _dias_mes, _MOV_ZONALES)
-    _alta_piv  = _pivot_dia_zon(_altas_mes, "_fa", "Q",       "sum",     _dias_mes, _MOV_ZONALES)
+    _reg_piv      = _pivot_dia_zon(_rt,     "_fr", "Q", "sum", _dias_mes, _MOV_ZONALES)
+    _alta_piv     = _pivot_dia_zon(_altas_mes, "_fa", "Q", "sum", _dias_mes, _MOV_ZONALES)
+    _reg_piv_ant  = _pivot_dia_zon(_rt_ant, "_fr", "Q", "sum", _dias_ant, _MOV_ZONALES)
+    _alta_piv_ant = _pivot_dia_zon(_altas_ant, "_fa", "Q", "sum", _dias_ant, _MOV_ZONALES)
 
-    _R1 = 1    # fila inicio bloque 1
     _CA = 1    # col A
 
-    # Fila 1: nombres de ZONAL — "Centrar en selección" sobre sus 3 cols (REG/ALT/%)
-    # openpyxl: horizontal="centerContinuous" aplica "Centrar en selección"
-    _zon_positions = {}   # zonal -> col inicio (1-based)
-    for zi, zon in enumerate(_MOV_ZONALES):
-        col_z = _CA + 1 + zi * 3
-        _zon_positions[zon] = col_z
-        # Primera celda del grupo: lleva el valor y el centrado continuo
-        cell = ws_mov.cell(row=_R1, column=col_z, value=zon)
-        cell.fill      = _mfill(_MOV_YEL)
-        cell.font      = _mfont(bold=True, color=_MOV_DKBL)
-        cell.alignment = Alignment(horizontal="centerContinuous", vertical="center")
-        cell.border    = _mall_bdr()
-        # Celdas 2ª y 3ª del grupo: vacías, mismo fondo, mismo centrado continuo
-        for _dc in [1, 2]:
-            _ec = ws_mov.cell(row=_R1, column=col_z+_dc)
+    def _write_bloque1(r_titulo, dias, dias_labels, reg_piv, alta_piv, titulo_periodo):
+        """Escribe el bloque REG_TOT/ALTAS (2 cols por zonal, sin %CONV).
+        Retorna (fila Total, col AUREN)."""
+        _col_auren = _CA + 1 + _NZ * 2
+
+        cell = ws_mov.cell(row=r_titulo, column=_CA, value=titulo_periodo)
+        cell.font = _mfont(bold=True, size=12)
+        cell.alignment = _maln("left")
+
+        _r_zon = r_titulo + 1
+        for zi, zon in enumerate(_MOV_ZONALES):
+            col_z = _CA + 1 + zi * 2
+            cell = ws_mov.cell(row=_r_zon, column=col_z, value=zon)
+            cell.fill      = _mfill(_MOV_YEL)
+            cell.font      = _mfont(bold=True, color=_MOV_DKBL)
+            cell.alignment = Alignment(horizontal="centerContinuous", vertical="center")
+            cell.border    = _mall_bdr()
+            _ec = ws_mov.cell(row=_r_zon, column=col_z+1)
             _ec.fill      = _mfill(_MOV_YEL)
             _ec.alignment = Alignment(horizontal="centerContinuous", vertical="center")
             _ec.border    = _mall_bdr()
 
-    # AUREN (total) — misma lógica
-    _col_auren = _CA + 1 + _NZ * 3
-    cell = ws_mov.cell(row=_R1, column=_col_auren, value="AUREN")
-    cell.fill      = _mfill(_MOV_YEL)
-    cell.font      = _mfont(bold=True, color=_MOV_DKBL)
-    cell.alignment = Alignment(horizontal="centerContinuous", vertical="center")
-    cell.border    = _mall_bdr()
-    for _dc in [1, 2]:
-        _ec = ws_mov.cell(row=_R1, column=_col_auren+_dc)
+        cell = ws_mov.cell(row=_r_zon, column=_col_auren, value="AUREN")
+        cell.fill      = _mfill(_MOV_YEL)
+        cell.font      = _mfont(bold=True, color=_MOV_DKBL)
+        cell.alignment = Alignment(horizontal="centerContinuous", vertical="center")
+        cell.border    = _mall_bdr()
+        _ec = ws_mov.cell(row=_r_zon, column=_col_auren+1)
         _ec.fill      = _mfill(_MOV_YEL)
         _ec.alignment = Alignment(horizontal="centerContinuous", vertical="center")
         _ec.border    = _mall_bdr()
 
-    # col A fila 1 vacía con fondo amarillo
-    _c_a1 = ws_mov.cell(row=_R1, column=_CA)
-    _c_a1.fill = _mfill(_MOV_YEL)
-    _c_a1.border = _mall_bdr()
+        _c_a1 = ws_mov.cell(row=_r_zon, column=_CA)
+        _c_a1.fill = _mfill(_MOV_YEL); _c_a1.border = _mall_bdr()
 
-    # Fila 2: sub-encabezados
-    _c_a2 = ws_mov.cell(row=_R1+1, column=_CA, value="Fecha")
-    _c_a2.fill = _mfill(_MOV_YEL); _c_a2.font = _mfont(bold=True, color=_MOV_DKBL)
-    _c_a2.alignment = _maln("center"); _c_a2.border = _mall_bdr()
+        _r_hdr = _r_zon + 1
+        _c_a2 = ws_mov.cell(row=_r_hdr, column=_CA, value="Fecha")
+        _c_a2.fill = _mfill(_MOV_YEL); _c_a2.font = _mfont(bold=True, color=_MOV_DKBL)
+        _c_a2.alignment = _maln("center"); _c_a2.border = _mall_bdr()
 
-    for zi in range(_NZ + 1):   # +1 para AUREN
-        col_z = _CA + 1 + zi * 3
-        for ci, (hdr, hfill, hfont) in enumerate([
-            ("REG_TOT", _MOV_HDR2_BG, _MOV_HDR2_FG),  # fondo blanco, texto negro
-            ("ALTAS",   _MOV_HDR2_BG, _MOV_HDR2_FG),  # fondo blanco, texto negro
-            ("%CONV.",  None,          _MOV_CONV),      # sin fondo, texto azul oscuro
-        ]):
-            cell = ws_mov.cell(row=_R1+1, column=col_z+ci, value=hdr)
-            if hfill:
-                cell.fill = _mfill(hfill)
-            cell.font      = _mfont(bold=True, color=hfont)
-            cell.alignment = _maln("center")
-            cell.border    = _mall_bdr()
+        for zi in range(_NZ + 1):
+            col_z = _CA + 1 + zi * 2
+            for ci, hdr in enumerate(["REG_TOT", "ALTAS"]):
+                cell = ws_mov.cell(row=_r_hdr, column=col_z+ci, value=hdr)
+                cell.fill      = _mfill(_MOV_HDR2_BG)
+                cell.font      = _mfont(bold=True, color=_MOV_HDR2_FG)
+                cell.alignment = _maln("center")
+                cell.border    = _mall_bdr()
 
-    # Función de fórmula %CONV
-    def _pct_conv_formula(alt_col_l, reg_col_l, row):
-        return f'=IFERROR({alt_col_l}{row}/{reg_col_l}{row},"")'
+        _r_data_start = _r_hdr + 1
+        for di, (dia, lbl) in enumerate(zip(dias, dias_labels)):
+            r = _r_data_start + di
+            cell = ws_mov.cell(row=r, column=_CA, value=lbl)
+            cell.font = _mfont(); cell.alignment = _maln("center"); cell.border = _mall_bdr()
 
-    # Filas de datos diarios
-    _r_data_start = _R1 + 2
-    for di, (dia, lbl) in enumerate(zip(_dias_mes, _dias_labels)):
-        r = _r_data_start + di
-        # col A: fecha con formato ddd dd
-        cell = ws_mov.cell(row=r, column=_CA, value=lbl)
-        cell.font = _mfont(); cell.alignment = _maln("center"); cell.border = _mall_bdr()
+            for zi, zon in enumerate(_MOV_ZONALES):
+                col_z = _CA + 1 + zi * 2
+                reg_v = int(reg_piv.loc[dia, zon])  if zon in reg_piv.columns  else 0
+                alt_v = int(alta_piv.loc[dia, zon]) if zon in alta_piv.columns else 0
+                c_reg = ws_mov.cell(row=r, column=col_z,   value=reg_v)
+                c_reg.font = _mfont(); c_reg.alignment = _maln("center"); c_reg.border = _mall_bdr()
+                c_alt = ws_mov.cell(row=r, column=col_z+1, value=alt_v)
+                c_alt.font = _mfont(); c_alt.alignment = _maln("center"); c_alt.border = _mall_bdr()
 
-        for zi, zon in enumerate(_MOV_ZONALES):
-            col_z = _CA + 1 + zi * 3
-            reg_v  = int(_reg_piv.loc[dia, zon])  if zon in _reg_piv.columns  else 0
-            alt_v  = int(_alta_piv.loc[dia, zon]) if zon in _alta_piv.columns else 0
-            c_reg = ws_mov.cell(row=r, column=col_z,   value=reg_v)
-            c_reg.font = _mfont(); c_reg.alignment = _maln("center"); c_reg.border = _mall_bdr()
-            c_alt = ws_mov.cell(row=r, column=col_z+1, value=alt_v)
-            c_alt.font = _mfont(); c_alt.alignment = _maln("center"); c_alt.border = _mall_bdr()
-            c_pct = ws_mov.cell(row=r, column=col_z+2,
-                value=_pct_conv_formula(get_column_letter(col_z+1), get_column_letter(col_z), r))
-            c_pct.number_format = "0%"; c_pct.font = _mfont()
-            c_pct.alignment = _maln("center"); c_pct.border = _mall_bdr()
+            _reg_cols = "+".join(get_column_letter(_CA+1+zi*2) + str(r) for zi in range(_NZ))
+            _alt_cols = "+".join(get_column_letter(_CA+2+zi*2) + str(r) for zi in range(_NZ))
+            c_ar = ws_mov.cell(row=r, column=_col_auren,   value=f"={_reg_cols}")
+            c_ar.font = _mfont(); c_ar.alignment = _maln("center"); c_ar.border = _mall_bdr()
+            c_aa = ws_mov.cell(row=r, column=_col_auren+1, value=f"={_alt_cols}")
+            c_aa.font = _mfont(); c_aa.alignment = _maln("center"); c_aa.border = _mall_bdr()
 
-        # AUREN (sumas de todos los zonales)
-        col_z = _col_auren
-        _reg_cols = "+".join(get_column_letter(_CA+1+zi*3) + str(r) for zi in range(_NZ))
-        _alt_cols = "+".join(get_column_letter(_CA+2+zi*3) + str(r) for zi in range(_NZ))
-        c_ar = ws_mov.cell(row=r, column=col_z,   value=f"={_reg_cols}")
-        c_ar.font = _mfont(); c_ar.alignment = _maln("center"); c_ar.border = _mall_bdr()
-        c_aa = ws_mov.cell(row=r, column=col_z+1, value=f"={_alt_cols}")
-        c_aa.font = _mfont(); c_aa.alignment = _maln("center"); c_aa.border = _mall_bdr()
-        c_ap = ws_mov.cell(row=r, column=col_z+2,
-            value=_pct_conv_formula(get_column_letter(col_z+1), get_column_letter(col_z), r))
-        c_ap.number_format = "0%"; c_ap.font = _mfont(color=_MOV_CONV)
-        c_ap.alignment = _maln("center"); c_ap.border = _mall_bdr()
+        _r_tot = _r_data_start + len(dias)
+        cell = ws_mov.cell(row=_r_tot, column=_CA, value="Total")
+        cell.font = _mfont(bold=True); cell.alignment = _maln("center"); cell.border = _mall_bdr()
+        _r0d = _r_data_start; _r1d = _r_tot - 1
+        for zi in range(_NZ + 1):
+            col_z = _CA + 1 + zi * 2
+            c_sr = ws_mov.cell(row=_r_tot, column=col_z,
+                               value=f"=SUM({get_column_letter(col_z)}{_r0d}:{get_column_letter(col_z)}{_r1d})")
+            c_sr.font = _mfont(bold=True); c_sr.alignment = _maln("center"); c_sr.border = _mall_bdr()
+            c_sa = ws_mov.cell(row=_r_tot, column=col_z+1,
+                               value=f"=SUM({get_column_letter(col_z+1)}{_r0d}:{get_column_letter(col_z+1)}{_r1d})")
+            c_sa.font = _mfont(bold=True); c_sa.alignment = _maln("center"); c_sa.border = _mall_bdr()
 
-    # Fila Total (fila 11 en el modelo = r_data_start + n_dias)
-    _r_tot1 = _r_data_start + len(_dias_mes)
-    cell = ws_mov.cell(row=_r_tot1, column=_CA, value="Total")
-    cell.font = _mfont(bold=True); cell.alignment = _maln("center"); cell.border = _mall_bdr()
-    _r0d = _r_data_start; _r1d = _r_tot1 - 1
-    for zi in range(_NZ + 1):
-        col_z = _CA + 1 + zi * 3
-        c_sr = ws_mov.cell(row=_r_tot1, column=col_z,
-                           value=f"=SUM({get_column_letter(col_z)}{_r0d}:{get_column_letter(col_z)}{_r1d})")
-        c_sr.font = _mfont(bold=True); c_sr.alignment = _maln("center"); c_sr.border = _mall_bdr()
-        c_sa = ws_mov.cell(row=_r_tot1, column=col_z+1,
-                           value=f"=SUM({get_column_letter(col_z+1)}{_r0d}:{get_column_letter(col_z+1)}{_r1d})")
-        c_sa.font = _mfont(bold=True); c_sa.alignment = _maln("center"); c_sa.border = _mall_bdr()
-        c_sp = ws_mov.cell(row=_r_tot1, column=col_z+2,
-                           value=f"={get_column_letter(col_z+1)}{_r_tot1}/{get_column_letter(col_z)}{_r_tot1}")
-        c_sp.number_format = "0%"; c_sp.font = _mfont(bold=True)
-        c_sp.alignment = _maln("center"); c_sp.border = _mall_bdr()
+        return _r_tot, _col_auren
 
-    # ════════════════════════════════════════════════════════════════
-    # BLOQUE 2 — ALTAS TOTALES / REGULARES / FLEX
-    # Fila _R2: título; Fila _R2+1: encabezados; Fila _R2+2+: datos
-    # 3 subtablas: A–I (TOTALES), K–S (REGULARES), U–AC (FLEX)
-    # Col J y T vacías (separadoras)
-    # ════════════════════════════════════════════════════════════════
-    _R2 = _r_tot1 + 6   # deja ~5 filas de margen (Proyectado, Cuota, %Avance + blancos)
+    _R1 = 1
+    _r_tot1_act, _col_auren1 = _write_bloque1(_R1, _dias_mes, _dias_labels, _reg_piv, _alta_piv, PERIODO)
 
-    # Proyectado (fila _r_tot1 + 1)
-    _r_proy1 = _r_tot1 + 1
-    cell = ws_mov.cell(row=_r_proy1, column=_CA, value="Proyectado")
-    cell.font = _mfont(bold=True); cell.alignment = _maln("center"); cell.border = _mall_bdr()
-    for zi in range(_NZ + 1):
-        col_z = _CA + 1 + zi * 3
-        _alt_col_l = get_column_letter(col_z + 1)
-        _reg_col_l = get_column_letter(col_z)
-        # Proyectado = ROUND((ALTAS_Total / dias_transcurridos) * dias_totales_mes, 0)
-        _f = f"=ROUND(({_alt_col_l}{_r_tot1}/TDS!$B${_r_param})*TDS!$D${_r_param},0)"
-        c = ws_mov.cell(row=_r_proy1, column=col_z+1, value=_f)
-        c.font = _mfont(); c.alignment = _maln("center"); c.border = _mall_bdr()
-        # REG vacío, %CONV vacío
-        ws_mov.cell(row=_r_proy1, column=col_z).border   = _mall_bdr()
-        ws_mov.cell(row=_r_proy1, column=col_z+2).border = _mall_bdr()
+    _R1_ANT = _r_tot1_act + 3
+    _r_tot1_ant, _col_auren1_ant = _write_bloque1(
+        _R1_ANT, _dias_ant, _dias_ant_labels, _reg_piv_ant, _alta_piv_ant, PERIODO_ANT)
 
-    # Cuota (fila _r_tot1 + 2)
-    _r_cuota1 = _r_tot1 + 2
-    cell = ws_mov.cell(row=_r_cuota1, column=_CA, value="Cuota")
-    cell.font = _mfont(bold=True); cell.alignment = _maln("center"); cell.border = _mall_bdr()
-    for zi, zon in enumerate(_MOV_ZONALES):
-        col_z = _CA + 1 + zi * 3
-        cuota_v = _tds_cuota_zon.get(zon, 0)
-        c = ws_mov.cell(row=_r_cuota1, column=col_z+1, value=cuota_v)
-        c.font = _mfont(); c.alignment = _maln("center"); c.border = _mall_bdr()
-        ws_mov.cell(row=_r_cuota1, column=col_z).border   = _mall_bdr()
-        ws_mov.cell(row=_r_cuota1, column=col_z+2).border = _mall_bdr()
-    # AUREN cuota total
-    col_z = _col_auren
-    _auren_cuota_cols = "+".join(
-        get_column_letter(_CA+2+zi*3)+str(_r_cuota1) for zi in range(_NZ)
-    )
-    c = ws_mov.cell(row=_r_cuota1, column=col_z+1, value=f"={_auren_cuota_cols}")
-    c.font = _mfont(); c.alignment = _maln("center"); c.border = _mall_bdr()
+    # ── Tabla lateral T:W — comparativo ALTAS "AL <fecha>" actual vs anterior ──
+    _lbl_act = _mov_ultimo_dia.strftime("%d/%m")
+    _lbl_ant = _mov_ant_ultimo_dia.strftime("%d/%m")
 
-    # %Avance (fila _r_tot1 + 3)
-    _r_av1 = _r_tot1 + 3
-    cell = ws_mov.cell(row=_r_av1, column=_CA, value="%Avance")
-    cell.font = _mfont(bold=True); cell.alignment = _maln("center"); cell.border = _mall_bdr()
-    for zi in range(_NZ + 1):
-        col_z = _CA + 1 + zi * 3
-        _alt_l = get_column_letter(col_z+1)
-        c = ws_mov.cell(row=_r_av1, column=col_z+1,
-                        value=f"={_alt_l}{_r_tot1}/{_alt_l}{_r_cuota1}")
-        c.number_format = "0%"; c.font = _mfont()
-        c.alignment = _maln("center"); c.border = _mall_bdr()
-        ws_mov.cell(row=_r_av1, column=col_z).border   = _mall_bdr()
-        ws_mov.cell(row=_r_av1, column=col_z+2).border = _mall_bdr()
+    def _write_tabla_al_fecha(r_titulo, titulo, fila_totales_actual, fila_totales_anterior):
+        """Compara el total de cada zonal (fila Total de un bloque) actual vs anterior."""
+        cell = ws_mov.cell(row=r_titulo, column=20, value=titulo)
+        cell.font = _mfont(bold=True); cell.alignment = _maln("left")
 
-    # ── Subtablas TOTALES / REGULARES / FLEX ─────────────────────────────
-    # Columnas de inicio: A=1, K=11, U=21
-    _R2_HDR_TITLE = _R2     # títulos "ALTAS TOTALES" etc
-    _R2_HDR_COL   = _R2 + 1
-    _R2_DATA      = _R2 + 2
-
-    # Pivots: ALTAS TOTALES (todas RIESG==0), REGULARES (Scoring!='FLEX'), FLEX (Scoring=='FLEX')
-    def _alta_pivot_dia(filtro_fn, dias):
-        _d = _altas_mes[filtro_fn(_altas_mes)].copy() if filtro_fn else _altas_mes.copy()
-        _p = _d.groupby([_d["_fa"].dt.normalize(), "zonal2"])["Q"].sum().unstack(fill_value=0)
-        return _p.reindex(index=dias, columns=_MOV_ZONALES, fill_value=0)
-
-    _piv_tot  = _alta_pivot_dia(None,                                      _dias_mes)
-    _piv_reg  = _alta_pivot_dia(lambda d: d["Scoring"] != "FLEX",          _dias_mes)
-    _piv_flex = _alta_pivot_dia(lambda d: d["Scoring"] == "FLEX",          _dias_mes)
-
-    _SUBTABLAS = [
-        (1,  "ALTAS TOTALES",   _piv_tot,  None),
-        (11, "ALTAS REGULARES", _piv_reg,  "reg"),
-        (21, "ALTAS FLEX",      _piv_flex, "flex"),
-    ]
-
-    _r_tot2 = {}   # guarda fila Total de cada subtabla para las filas %REGULAR/%FLEX
-
-    for _c_ini, _titulo, _piv, _key in _SUBTABLAS:
-        # Título
-        cell = ws_mov.cell(row=_R2_HDR_TITLE, column=_c_ini, value=_titulo)
-        cell.font = _mfont(bold=True, size=11)
-        cell.alignment = _maln("left")
-
-        # Encabezados de columna
-        _hdrs2 = ["Fecha"] + _MOV_ZONALES + ["Total general"]
-        for ci, hdr in enumerate(_hdrs2):
-            cell = ws_mov.cell(row=_R2_HDR_COL, column=_c_ini+ci, value=hdr)
+        _r_hdr = r_titulo + 1
+        for ci, hdr in enumerate(["ZONAL", f"AL {_lbl_ant}", f"AL {_lbl_act}", "%Variación"]):
+            cell = ws_mov.cell(row=_r_hdr, column=20+ci, value=hdr)
             cell.fill      = _mfill(_MOV_B2_BG)
             cell.font      = _mfont(bold=True, color=_MOV_B2_FG)
             cell.alignment = _maln("center")
             cell.border    = _mall_bdr()
 
-        # Datos diarios
-        for di, (dia, lbl) in enumerate(zip(_dias_mes, _dias_labels)):
-            r = _R2_DATA + di
-            vals = [int(_piv.loc[dia, zon]) if zon in _piv.columns else 0
-                    for zon in _MOV_ZONALES]
-            row_data = [lbl] + vals + [sum(vals)]
-            for ci, v in enumerate(row_data):
-                cell = ws_mov.cell(row=r, column=_c_ini+ci, value=v)
-                cell.font      = _mfont()
-                cell.alignment = _maln("center" if ci > 0 else "left")
+        for zi, zon in enumerate(_MOV_ZONALES + ["AUREN"]):
+            r = _r_hdr + 1 + zi
+            cell = ws_mov.cell(row=r, column=20, value=zon)
+            cell.font = _mfont(bold=(zon=="AUREN")); cell.alignment = _maln("left"); cell.border = _mall_bdr()
+
+            _col_ant_l = get_column_letter(_col_auren1_ant+1) if zon == "AUREN" else get_column_letter(_CA+2+zi*2)
+            _col_act_l = get_column_letter(_col_auren1+1)     if zon == "AUREN" else get_column_letter(_CA+2+zi*2)
+            c_u = ws_mov.cell(row=r, column=21, value=f"={_col_ant_l}{fila_totales_anterior}")
+            c_u.font = _mfont(); c_u.alignment = _maln("center"); c_u.border = _mall_bdr()
+            c_v = ws_mov.cell(row=r, column=22, value=f"={_col_act_l}{fila_totales_actual}")
+            c_v.font = _mfont(); c_v.alignment = _maln("center"); c_v.border = _mall_bdr()
+            c_w = ws_mov.cell(row=r, column=23, value=f'=IFERROR((V{r}-U{r})/U{r},"")')
+            c_w.number_format = "0%"; c_w.font = _mfont()
+            c_w.alignment = _maln("center"); c_w.border = _mall_bdr()
+
+        _rng_w = f"W{_r_hdr+1}:W{_r_hdr+len(_MOV_ZONALES)+1}"
+        ws_mov.conditional_formatting.add(_rng_w, CellIsRule(
+            operator="lessThan", formula=["0"],
+            fill=_mfill("FFC7CE"), font=Font(color="9C0006")))
+        ws_mov.conditional_formatting.add(_rng_w, CellIsRule(
+            operator="greaterThan", formula=["0.03"],
+            fill=_mfill("C6EFCE"), font=Font(color="006100")))
+        ws_mov.conditional_formatting.add(_rng_w, FormulaRule(
+            formula=[f"AND(W{_r_hdr+1}>=0,W{_r_hdr+1}<=0.03)"],
+            fill=_mfill("FFEB9C"), font=Font(color="9C5700")))
+
+        return _r_hdr + 1 + len(_MOV_ZONALES) + 1   # fila siguiente libre
+
+    _r_tabla_al_2 = _write_tabla_al_fecha(_R1, "ALTAS", _r_tot1_act, _r_tot1_ant)
+
+    # ════════════════════════════════════════════════════════════════
+    # BLOQUE 2 — ALTAS TOTALES / REGULARES / FLEX
+    # Se repite: mes actual y mes anterior, cada uno truncado.
+    # ════════════════════════════════════════════════════════════════
+    _R2 = _r_tot1_ant + 6
+
+    def _alta_pivot_dia(df_mes, filtro_fn, dias):
+        _d = df_mes[filtro_fn(df_mes)].copy() if filtro_fn else df_mes.copy()
+        _p = _d.groupby([_d["_fa"].dt.normalize(), "zonal2"])["Q"].sum().unstack(fill_value=0)
+        return _p.reindex(index=dias, columns=_MOV_ZONALES, fill_value=0)
+
+    def _write_bloque2(r_start, dias, dias_labels, df_mes, header_label):
+        _piv_tot  = _alta_pivot_dia(df_mes, None,                             dias)
+        _piv_reg  = _alta_pivot_dia(df_mes, lambda d: d["Scoring"] != "FLEX", dias)
+        _piv_flex = _alta_pivot_dia(df_mes, lambda d: d["Scoring"] == "FLEX", dias)
+
+        _SUBTABLAS = [
+            (1,  "ALTAS TOTALES",   _piv_tot,  None),
+            (11, "ALTAS REGULARES", _piv_reg,  "reg"),
+            (21, "ALTAS FLEX",      _piv_flex, "flex"),
+        ]
+        _r_tot = {}
+        _r_hdr_col = r_start + 1
+        _r_data    = r_start + 2
+        for _c_ini, _titulo, _piv, _key in _SUBTABLAS:
+            cell = ws_mov.cell(row=r_start, column=_c_ini, value=_titulo)
+            cell.font = _mfont(bold=True, size=11); cell.alignment = _maln("left")
+
+            _hdrs2 = [header_label] + _MOV_ZONALES + ["Total general"]
+            for ci, hdr in enumerate(_hdrs2):
+                cell = ws_mov.cell(row=_r_hdr_col, column=_c_ini+ci, value=hdr)
+                cell.fill      = _mfill(_MOV_B2_BG)
+                cell.font      = _mfont(bold=True, color=_MOV_B2_FG)
+                cell.alignment = _maln("center")
                 cell.border    = _mall_bdr()
 
-        # Fila Total general
-        _r_tg = _R2_DATA + len(_dias_mes)
-        _r_tot2[_key] = _r_tg
-        cell = ws_mov.cell(row=_r_tg, column=_c_ini, value="Total general")
-        cell.font = _mfont(bold=True); cell.alignment = _maln("center"); cell.border = _mall_bdr()
+            for di, (dia, lbl) in enumerate(zip(dias, dias_labels)):
+                r = _r_data + di
+                vals = [int(_piv.loc[dia, zon]) if zon in _piv.columns else 0
+                        for zon in _MOV_ZONALES]
+                row_data = [lbl] + vals + [sum(vals)]
+                for ci, v in enumerate(row_data):
+                    cell = ws_mov.cell(row=r, column=_c_ini+ci, value=v)
+                    cell.font      = _mfont()
+                    cell.alignment = _maln("center" if ci > 0 else "left")
+                    cell.border    = _mall_bdr()
+
+            _r_tg = _r_data + len(dias)
+            _r_tot[_key] = _r_tg
+            cell = ws_mov.cell(row=_r_tg, column=_c_ini, value="Total general")
+            cell.font = _mfont(bold=True); cell.alignment = _maln("center"); cell.border = _mall_bdr()
+            for ci in range(_NZ + 1):
+                _cl  = get_column_letter(_c_ini + 1 + ci)
+                c_t  = ws_mov.cell(row=_r_tg, column=_c_ini+1+ci,
+                                   value=f"=SUM({_cl}{_r_data}:{_cl}{_r_tg-1})")
+                c_t.font = _mfont(bold=True); c_t.alignment = _maln("center"); c_t.border = _mall_bdr()
+
+        _r_preg = _r_tot["reg"] + 1
+        cell = ws_mov.cell(row=_r_preg, column=11, value="%REGULAR")
+        cell.font = _mfont(bold=True); cell.alignment = _maln("left"); cell.border = _mall_bdr()
         for ci in range(_NZ + 1):
-            _cl  = get_column_letter(_c_ini + 1 + ci)
-            c_t  = ws_mov.cell(row=_r_tg, column=_c_ini+1+ci,
-                               value=f"=SUM({_cl}{_R2_DATA}:{_cl}{_r_tg-1})")
-            c_t.font = _mfont(bold=True); c_t.alignment = _maln("center"); c_t.border = _mall_bdr()
+            _col_reg = get_column_letter(12 + ci)
+            _col_tot = get_column_letter(2  + ci)
+            c = ws_mov.cell(row=_r_preg, column=12+ci,
+                            value=f"=IFERROR({_col_reg}{_r_tot['reg']}/{_col_tot}{_r_tot[None]},\"\")")
+            c.number_format = "0%"; c.font = _mfont()
+            c.alignment = _maln("center"); c.border = _mall_bdr()
 
-    # Fila %REGULAR (debajo del Total de REGULARES, col 11)
-    _r_preg = _r_tot2["reg"] + 1
-    cell = ws_mov.cell(row=_r_preg, column=11, value="%REGULAR")
-    cell.font = _mfont(bold=True); cell.alignment = _maln("left"); cell.border = _mall_bdr()
-    for ci in range(_NZ + 1):
-        _col_reg = get_column_letter(12 + ci)
-        _col_tot = get_column_letter(2  + ci)
-        _r_tg_reg = _r_tot2["reg"]; _r_tg_tot = _r_tot2[None]
-        c = ws_mov.cell(row=_r_preg, column=12+ci,
-                        value=f"=IFERROR({_col_reg}{_r_tg_reg}/{_col_tot}{_r_tg_tot},\"\")")
-        c.number_format = "0%"; c.font = _mfont()
-        c.alignment = _maln("center"); c.border = _mall_bdr()
+        _r_pflex = _r_tot["flex"] + 1
+        cell = ws_mov.cell(row=_r_pflex, column=21, value="%FLEX")
+        cell.font = _mfont(bold=True); cell.alignment = _maln("left"); cell.border = _mall_bdr()
+        for ci in range(_NZ + 1):
+            _col_flex = get_column_letter(22 + ci)
+            _col_tot  = get_column_letter(2  + ci)
+            c = ws_mov.cell(row=_r_pflex, column=22+ci,
+                            value=f"=IFERROR({_col_flex}{_r_tot['flex']}/{_col_tot}{_r_tot[None]},\"\")")
+            c.number_format = "0%"; c.font = _mfont()
+            c.alignment = _maln("center"); c.border = _mall_bdr()
 
-    # Fila %FLEX (debajo del Total de FLEX, col 21)
-    _r_pflex = _r_tot2["flex"] + 1
-    cell = ws_mov.cell(row=_r_pflex, column=21, value="%FLEX")
-    cell.font = _mfont(bold=True); cell.alignment = _maln("left"); cell.border = _mall_bdr()
-    for ci in range(_NZ + 1):
-        _col_flex = get_column_letter(22 + ci)
-        _col_tot  = get_column_letter(2  + ci)
-        _r_tg_fl  = _r_tot2["flex"]; _r_tg_tot = _r_tot2[None]
-        c = ws_mov.cell(row=_r_pflex, column=22+ci,
-                        value=f"=IFERROR({_col_flex}{_r_tg_fl}/{_col_tot}{_r_tg_tot},\"\")")
-        c.number_format = "0%"; c.font = _mfont()
-        c.alignment = _maln("center"); c.border = _mall_bdr()
+        return max(_r_tot["reg"], _r_tot["flex"]) + 1
+
+    _r2_fin_act = _write_bloque2(_R2, _dias_mes, _dias_labels, _altas_mes, "Fecha")
+    _R2_ANT = _r2_fin_act + 7
+    _r2_fin_ant = _write_bloque2(_R2_ANT, _dias_ant, _dias_ant_labels, _altas_ant, "Fecha")
 
     # ════════════════════════════════════════════════════════════════
-    # BLOQUE 3 — 200MBPS / >=400MBPS / TV COMPLETA
+    # BLOQUE 3 — 200MBPS / >=400MBPS / TV COMPLETA (solo mes actual)
     # ════════════════════════════════════════════════════════════════
-    _R3 = max(_r_tot2["reg"], _r_tot2["flex"]) + 7
+    _R3 = _r2_fin_ant + 7
 
     def _vel_pivot(filtro_fn, dias):
         _d = _altas_mes[filtro_fn(_altas_mes)].copy()
@@ -3429,7 +3426,6 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
         cell = ws_mov.cell(row=_R3, column=_c_ini, value=_titulo)
         cell.font = _mfont(bold=True); cell.alignment = _maln("left")
 
-        # Encabezados: DIA + ZONALES + Total general
         _hdrs3 = ["DIA"] + _MOV_ZONALES + ["Total general"]
         for ci, hdr in enumerate(_hdrs3):
             cell = ws_mov.cell(row=_R3+1, column=_c_ini+ci, value=hdr)
@@ -3461,26 +3457,16 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
     # ════════════════════════════════════════════════════════════════
     _R4 = _R3 + 2 + len(_dias_mes) + 7
 
-    # Pivot mes actual: count distinct DNI_VENDEDOR por día y zonal
-    _piv_vdd_act = _pivot_dia_zon(_altas_mes,  "_fa", "DNI_VENDEDOR", "nunique", _dias_mes, _MOV_ZONALES)
-    # Pivot mes anterior: misma cantidad de días (alinear al día del mes, no fecha absoluta)
+    _piv_vdd_act = _pivot_dia_zon(_altas_mes, "_fa", "DNI_VENDEDOR", "nunique", _dias_mes, _MOV_ZONALES)
     _piv_vdd_ant = _pivot_dia_zon(_altas_ant, "_fa", "DNI_VENDEDOR", "nunique", _dias_ant, _MOV_ZONALES)
-    # Reindexar dias_ant con índice numérico de día (1..n) para alinear con dias_mes
-    _vdd_ant_by_day = _piv_vdd_ant.copy()
-    _vdd_ant_by_day.index = range(1, len(_dias_ant)+1)
-    _vdd_act_by_day = _piv_vdd_act.copy()
-    _vdd_act_by_day.index = range(1, len(_dias_mes)+1)
 
     _BLOQ4 = [
-        (1,  "VENDEDORES C/ VENTA MES ACTUAL",    _vdd_act_by_day, _dias_labels, "DIA"),
-        (11, "VENDEDORES C/ VENTA MES ANTERIOR",  _vdd_ant_by_day,
-             [d.strftime("%a %d").lower().replace("mon","lun").replace("tue","mar")\
-              .replace("wed","mié").replace("thu","jue").replace("fri","vie")\
-              .replace("sat","sáb").replace("sun","dom") for d in _dias_ant], "Fecha"),
+        (1,  "VENDEDORES C/ VENTA MES ACTUAL",   _piv_vdd_act, _dias_mes, _dias_labels,     "Fecha"),
+        (11, "VENDEDORES C/ VENTA MES ANTERIOR", _piv_vdd_ant, _dias_ant, _dias_ant_labels, "Fecha"),
     ]
 
     _r_tg_vdd = {}
-    for _c_ini, _titulo, _piv_v, _dlabels, _dheader in _BLOQ4:
+    for _c_ini, _titulo, _piv_v, _dias_v, _dlabels, _dheader in _BLOQ4:
         cell = ws_mov.cell(row=_R4, column=_c_ini, value=_titulo)
         cell.font = _mfont(bold=True); cell.alignment = _maln("left")
 
@@ -3492,21 +3478,16 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
             cell.alignment = _maln("center")
             cell.border    = _mall_bdr()
 
-        _n_dias_v = len(_dlabels)
-        for di in range(_n_dias_v):
+        for di, (dia, lbl) in enumerate(zip(_dias_v, _dlabels)):
             r = _R4 + 2 + di
-            _dia_idx = _piv_v.index[di] if di < len(_piv_v) else None
-            if _dia_idx is not None:
-                vals = [int(_piv_v.loc[_dia_idx, zon]) if zon in _piv_v.columns else 0
-                        for zon in _MOV_ZONALES]
-            else:
-                vals = [0] * _NZ
-            for ci, v in enumerate([_dlabels[di]] + vals + [sum(vals)]):
+            vals = [int(_piv_v.loc[dia, zon]) if zon in _piv_v.columns else 0
+                    for zon in _MOV_ZONALES]
+            for ci, v in enumerate([lbl] + vals + [sum(vals)]):
                 cell = ws_mov.cell(row=r, column=_c_ini+ci, value=v)
                 cell.font = _mfont(); cell.alignment = _maln("center" if ci > 0 else "left")
                 cell.border = _mall_bdr()
 
-        _r_tg4 = _R4 + 2 + _n_dias_v
+        _r_tg4 = _R4 + 2 + len(_dias_v)
         _r_tg_vdd[_c_ini] = _r_tg4
         cell = ws_mov.cell(row=_r_tg4, column=_c_ini, value="Total general")
         cell.font = _mfont(bold=True); cell.alignment = _maln("center"); cell.border = _mall_bdr()
@@ -3516,43 +3497,45 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
                               value=f"=SUM({_cl}{_R4+2}:{_cl}{_r_tg4-1})")
             c_t.font = _mfont(bold=True); c_t.alignment = _maln("center"); c_t.border = _mall_bdr()
 
-    # Columna RATIO (U): VDD mes actual / VDD mes anterior, por zonal
-    _r_ratio_start = _R4 + 1
-    cell = ws_mov.cell(row=_R4, column=21, value="VENDEDORES C/ VENTA")
+    # Tabla lateral U — comparativo VENDEDORES C/ VENTA "AL <fecha>" actual vs anterior
+    _write_tabla_al_fecha_vdd_r = _R4
+    cell = ws_mov.cell(row=_R4, column=20, value="VENDEDORES C/ VENTA")
     cell.font = _mfont(bold=True); cell.alignment = _maln("left")
-    _hdrs_ratio = [""] + _MOV_ZONALES + ["Total general"]
-    for ci, hdr in enumerate(_hdrs_ratio):
-        cell = ws_mov.cell(row=_r_ratio_start, column=21+ci, value=hdr)
+    _r_hdr_vdd = _R4 + 1
+    for ci, hdr in enumerate(["ZONAL", f"AL {_lbl_ant}", f"AL {_lbl_act}", "%Variación"]):
+        cell = ws_mov.cell(row=_r_hdr_vdd, column=20+ci, value=hdr)
         cell.fill      = _mfill(_MOV_B4_BG)
         cell.font      = _mfont(bold=True, color=_MOV_B4_FG)
         cell.alignment = _maln("center")
         cell.border    = _mall_bdr()
 
-    _n_ratio = min(len(_dias_mes), len(_dias_ant))
-    for di in range(_n_ratio):
-        r        = _R4 + 2 + di
-        r_act_row = _R4 + 2 + di   # misma fila relativa que el bloque actual
-        r_ant_row = _R4 + 2 + di   # el bloque anterior tiene mismas filas
-        for ci in range(_NZ + 1):
-            _col_act = get_column_letter(2  + ci)
-            _col_ant = get_column_letter(12 + ci)
-            c = ws_mov.cell(row=r, column=22+ci,
-                            value=f"=IFERROR({_col_act}{r_act_row}/{_col_ant}{r_ant_row},\"\")")
-            c.number_format = "0%"; c.font = _mfont()
-            c.alignment = _maln("center"); c.border = _mall_bdr()
-
-    # Total ratio
-    _r_tg_ratio = _R4 + 2 + _n_ratio
-    cell = ws_mov.cell(row=_r_tg_ratio, column=21, value="Total general")
-    cell.font = _mfont(bold=True); cell.alignment = _maln("center"); cell.border = _mall_bdr()
     _r_act_tg = _r_tg_vdd[1]; _r_ant_tg = _r_tg_vdd[11]
-    for ci in range(_NZ + 1):
-        _col_act = get_column_letter(2  + ci)
-        _col_ant = get_column_letter(12 + ci)
-        c = ws_mov.cell(row=_r_tg_ratio, column=22+ci,
-                        value=f"=IFERROR({_col_act}{_r_act_tg}/{_col_ant}{_r_ant_tg},\"\")")
-        c.number_format = "0%"; c.font = _mfont(bold=True)
-        c.alignment = _maln("center"); c.border = _mall_bdr()
+    for zi, zon in enumerate(_MOV_ZONALES + ["AUREN"]):
+        r = _r_hdr_vdd + 1 + zi
+        cell = ws_mov.cell(row=r, column=20, value=zon)
+        cell.font = _mfont(bold=(zon=="AUREN")); cell.alignment = _maln("left"); cell.border = _mall_bdr()
+        # Bloque actual: col A=1(Fecha), B..(1+NZ)=zonales, (2+NZ)=Total general.
+        # Bloque anterior: col K=11(Fecha), L..(11+NZ)=zonales, (12+NZ)=Total general.
+        _col_act_l = get_column_letter(2 + _NZ)  if zon == "AUREN" else get_column_letter(2 + zi)
+        _col_ant_l = get_column_letter(12 + _NZ) if zon == "AUREN" else get_column_letter(12 + zi)
+        c_u = ws_mov.cell(row=r, column=21, value=f"={_col_ant_l}{_r_ant_tg}")
+        c_u.font = _mfont(); c_u.alignment = _maln("center"); c_u.border = _mall_bdr()
+        c_v = ws_mov.cell(row=r, column=22, value=f"={_col_act_l}{_r_act_tg}")
+        c_v.font = _mfont(); c_v.alignment = _maln("center"); c_v.border = _mall_bdr()
+        c_w = ws_mov.cell(row=r, column=23, value=f'=IFERROR((V{r}-U{r})/U{r},"")')
+        c_w.number_format = "0%"; c_w.font = _mfont()
+        c_w.alignment = _maln("center"); c_w.border = _mall_bdr()
+
+    _rng_w_vdd = f"W{_r_hdr_vdd+1}:W{_r_hdr_vdd+len(_MOV_ZONALES)+1}"
+    ws_mov.conditional_formatting.add(_rng_w_vdd, CellIsRule(
+        operator="lessThan", formula=["0"],
+        fill=_mfill("FFC7CE"), font=Font(color="9C0006")))
+    ws_mov.conditional_formatting.add(_rng_w_vdd, CellIsRule(
+        operator="greaterThan", formula=["0.03"],
+        fill=_mfill("C6EFCE"), font=Font(color="006100")))
+    ws_mov.conditional_formatting.add(_rng_w_vdd, FormulaRule(
+        formula=[f"AND(W{_r_hdr_vdd+1}>=0,W{_r_hdr_vdd+1}<=0.03)"],
+        fill=_mfill("FFEB9C"), font=Font(color="9C5700")))
 
     # ── Ancho de columnas MOVISTAR ────────────────────────────────────────
     ws_mov.column_dimensions["A"].width = 9
@@ -4061,6 +4044,9 @@ try:
 
     # ── Autoajustar filas en VDD3 ────────────────────────────────
     ws_vdd3.api.UsedRange.Rows.AutoFit()
+
+    # ── Autoajustar columnas E:V en VDD1 ──────────────────────────
+    ws_vdd1.api.Range("E:V").Columns.AutoFit()
 
     # ── Ocultar cuadrícula VDD3 via SheetViews ───────────────────
     try:
