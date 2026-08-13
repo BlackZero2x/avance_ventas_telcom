@@ -432,6 +432,35 @@ function _resolverPrioridad(body) {
   return PRIORITY_NORMAL;
 }
 
+// sendMessage() de whatsapp-web.js puede devolver `undefined` sin lanzar
+// excepción cuando WhatsApp Web cambió algo en su protocolo (mismo síntoma
+// que detecta el send-test periódico, ver más abajo). Antes esto quedaba
+// completamente silencioso: el endpoint respondía success:true con
+// messageId:null y no se generaba ningún log — indistinguible de un envío
+// real. Se registra aquí como WARN y alimenta el mismo contador de fallos
+// consecutivos que usa el send-test, así un patrón repetido en envíos
+// reales (no solo en la prueba cada 3h) también dispara el reinicio.
+function _registrarResultadoEnvio(kind, result, ctx) {
+  if (result && result.id) {
+    if (_sendTestFails > 0) log("INFO", "Envio recuperado tras fallos previos de protocolo");
+    _sendTestFails = 0;
+    log("INFO", kind, ctx);
+    return;
+  }
+  _sendTestFails++;
+  log("WARN", `${kind}: sendMessage devolvio resultado sin id (fallo #${_sendTestFails})`, ctx);
+  if (_sendTestFails >= 2) {
+    log("ERROR", "2 fallos consecutivos de protocolo en envios reales — protocolo WA degradado, reiniciando cliente");
+    _notificarError(
+      "Protocolo WA degradado (envio real)",
+      `sendMessage devolvio resultado sin id en 2 envios consecutivos (ultimo: ${kind}). Es probable un cambio de protocolo de Meta. Reiniciando cliente automaticamente.`
+    );
+    _sendTestFails = 0;
+    isReady = false;
+    _reiniciarCliente();
+  }
+}
+
 // Guard reutilizable: rechaza si el servidor no está listo o la cola está llena.
 function _guardReady(res) {
   if (!isReady) {
@@ -527,11 +556,7 @@ app.post("/send-text", async (req, res) => {
   if (!chatId) return res.status(404).json({ error: `Destinatario "${to}" no encontrado en config` });
   try {
     const result = await enqueue(() => waClient.sendMessage(chatId, message), _resolverPrioridad(req.body));
-    if (!result || !result.id) {
-      // sin id de confirmacion — comportamiento normal en version actual de WA Web
-    } else {
-      log("INFO", "Texto enviado", { to, chatId });
-    }
+    _registrarResultadoEnvio("Texto enviado", result, { to, chatId });
     res.json({ success: true, messageId: result?.id?._serialized || null });
   } catch (err) {
     log("ERROR", "Error al enviar texto", { to, error: err.message });
@@ -550,11 +575,7 @@ app.post("/send-image", async (req, res) => {
   try {
     const media = MessageMedia.fromFilePath(image_path);
     const result = await enqueue(() => waClient.sendMessage(chatId, media, { caption: caption || "" }), _resolverPrioridad(req.body));
-    if (!result || !result.id) {
-      // sin id de confirmacion — comportamiento normal en version actual de WA Web
-    } else {
-      log("INFO", "Imagen enviada", { to, chatId, image_path });
-    }
+    _registrarResultadoEnvio("Imagen enviada", result, { to, chatId, image_path });
     res.json({ success: true, messageId: result?.id?._serialized || null });
   } catch (err) {
     log("ERROR", "Error al enviar imagen", { to, error: err.message });
@@ -573,17 +594,28 @@ app.post("/send-file", async (req, res) => {
   try {
     const media = MessageMedia.fromFilePath(file_path);
     const result = await enqueue(() => waClient.sendMessage(chatId, media, { caption: caption || "" }), _resolverPrioridad(req.body));
-    if (!result || !result.id) {
-      // sin id de confirmacion — comportamiento normal en version actual de WA Web
-    } else {
-      log("INFO", "Archivo enviado", { to, chatId, file_path });
-    }
+    _registrarResultadoEnvio("Archivo enviado", result, { to, chatId, file_path });
     res.json({ success: true, messageId: result?.id?._serialized || null });
   } catch (err) {
     log("ERROR", "Error al enviar archivo", { to, error: err.message });
     res.status(500).json({ error: err.message });
   }
 });
+
+// Timeout genérico: si `promise` no resuelve en `ms`, rechaza con un error
+// cuyo mensaje contiene `label` — permite reusar la detección de contexto
+// muerto (_isContextoMuerto busca substrings de mensaje) para cuelgues
+// silenciosos que nunca lanzan Promise was collected / Protocol error.
+function _withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`${label} timeout tras ${ms}ms — contexto de Chrome probablemente muerto`)), ms)),
+  ]);
+}
+
+function _isMentionTimeout(err) {
+  return err && err.message && err.message.includes("contexto de Chrome probablemente muerto");
+}
 
 // --- Enviar texto con menciones ---
 app.post("/send-mention", async (req, res) => {
@@ -596,13 +628,28 @@ app.post("/send-mention", async (req, res) => {
     const mentionIds = mentions || [];
     log("INFO", "Intentando enviar menciones", { to, chatId, mentionIds });
 
-    // Resolver IDs a objetos Contact reales (necesario para que WA renderice menciones)
+    // Resolver IDs a objetos Contact reales (necesario para que WA renderice menciones).
+    // Cada resolución va con timeout de 20s: si getContactById() cuelga por un
+    // contexto de Chrome muerto que no lanza excepción propia, no debe bloquear
+    // el request (y con él, indirectamente, el resto del servidor) para siempre.
     const mentionContacts = [];
     for (const id of mentionIds) {
       try {
-        const contact = await waClient.getContactById(id);
+        const contact = await _withTimeout(waClient.getContactById(id), 20000, "getContactById");
         mentionContacts.push(contact);
       } catch (e) {
+        if (_isMentionTimeout(e) || _isContextoMuerto(e)) {
+          // Cuelgue real de Chrome: no tiene sentido seguir resolviendo el resto
+          // de menciones ni intentar el sendMessage — mismo tratamiento que un
+          // contexto muerto detectado en la cola (reiniciar cliente + drenar).
+          log("ERROR", "getContactById colgado — contexto WA muerto, reiniciando cliente y drenando cola", { to, id, error: e.message });
+          isReady = false;
+          _lastUploadError = Date.now();
+          _notificarError("Contexto WA muerto (send-mention)", `getContactById no respondio en 20s resolviendo menciones para "${to}". Reiniciando y drenando cola de ${_queue.length} pendientes.`);
+          _drenarCola("contexto de Chrome perdido (timeout en send-mention)");
+          setTimeout(() => _reiniciarCliente(), 3000);
+          return res.status(503).json({ error: "Contexto de WhatsApp perdido resolviendo menciones. El servidor se esta reiniciando, reintenta en unos segundos." });
+        }
         // Si no se puede resolver, construir objeto mínimo que whatsapp-web.js acepta
         log("WARN", `No se pudo resolver contacto ${id}, usando fallback`, { error: e.message });
         const [user] = id.split("@");
@@ -620,11 +667,7 @@ app.post("/send-mention", async (req, res) => {
       log("WARN", "Menciones fallaron, enviando sin ellas", { to, error: mentionErr.message });
       result = await enqueue(() => waClient.sendMessage(chatId, message), _prio);
     }
-    if (!result || !result.id) {
-      // sin id de confirmacion — comportamiento normal en version actual de WA Web
-    } else {
-      log("INFO", "Mensaje con menciones enviado", { to, chatId, menciones: mentionContacts.length });
-    }
+    _registrarResultadoEnvio("Mensaje con menciones enviado", result, { to, chatId, menciones: mentionContacts.length });
     res.json({ success: true, messageId: result?.id?._serialized || null });
   } catch (err) {
     log("ERROR", "Error al enviar menciones", { to, error: err.message, stack: err.stack });
@@ -642,11 +685,7 @@ app.post("/send-link", async (req, res) => {
   try {
     const message = description ? `${description}\n${url}` : url;
     const result = await enqueue(() => waClient.sendMessage(chatId, message), _resolverPrioridad(req.body));
-    if (!result || !result.id) {
-      // sin id de confirmacion — comportamiento normal en version actual de WA Web
-    } else {
-      log("INFO", "Link enviado", { to, chatId, url });
-    }
+    _registrarResultadoEnvio("Link enviado", result, { to, chatId, url });
     res.json({ success: true, messageId: result?.id?._serialized || null });
   } catch (err) {
     log("ERROR", "Error al enviar link", { to, error: err.message });

@@ -43,11 +43,11 @@ def _obtener_fecha_maxima(df):
 def _construir_tabla_zonal2(df_rh, df_rt, df_altas, zonal2_vals):
     """
     Construye tabla con supervisores y vendedores de zonales específicas.
-    Usa RRHH como base principal y suma RT/ALTAS sobre vendedores de esas zonales.
+    Usa RRHH (MiniMatriz) como base principal y suma RT/ALTAS sobre vendedores de esas zonales.
 
     Args:
-        df_rh: DataFrame de hoja RH (estructura base: SUPERVISOR, VENDEDOR, ZONA, etc.)
-        df_rt: DataFrame de hoja RT (para contar RT por vendedor)
+        df_rh: DataFrame de hoja RH (MiniMatriz con OPERADOR, ESTADO, feedback_rh, etc.)
+        df_rt: DataFrame de hoja RT (para contar RT y RUS por vendedor)
         df_altas: DataFrame de hoja ALTAS (para contar ALTAS por vendedor)
         zonal2_vals: lista de valores zonal2 a incluir (ej. ['TACNA', 'ILO'])
 
@@ -60,8 +60,9 @@ def _construir_tabla_zonal2(df_rh, df_rt, df_altas, zonal2_vals):
     # Filtrar RRHH por zonales (base principal)
     rh_filt = df_rh[df_rh['zonal2'].isin(zonal2_vals)].copy()
 
-    # Aplicar filtros: ESTADO='ACTIVO' y feedback_rh='EN CAMPO'
+    # Aplicar filtros: OPERADOR='MOVISTAR', ESTADO='ACTIVO' y feedback_rh='EN CAMPO'
     rh_filt = rh_filt[
+        (rh_filt['OPERADOR'].fillna('').str.strip().str.upper() == 'MOVISTAR') &
         (rh_filt['ESTADO'].fillna('').str.strip().str.upper() == 'ACTIVO') &
         (rh_filt['feedback_rh'].fillna('').str.strip().str.upper() == 'EN CAMPO')
     ].copy()
@@ -75,6 +76,8 @@ def _construir_tabla_zonal2(df_rh, df_rt, df_altas, zonal2_vals):
     tabla = tabla.sort_values(['SUPERVISOR', 'VENDEDOR']).reset_index(drop=True)
 
     # Calcular zonal2 en RT y ALTAS para los joins
+    df_rt = df_rt.copy()
+    df_altas = df_altas.copy()
     df_rt['zonal2'] = df_rt['zonal'].apply(_calcular_zonal2)
     df_altas['zonal2'] = df_altas['zonal'].apply(_calcular_zonal2)
 
@@ -85,6 +88,16 @@ def _construir_tabla_zonal2(df_rh, df_rt, df_altas, zonal2_vals):
     # Contar RT por VENDEDOR
     rt_counts = rt_filt.groupby('VENDEDOR').size().reset_index(name='RT')
 
+    # Sumar Flag_Registro_Unico (RUS) por VENDEDOR (valores numéricos del Excel)
+    # Flag_Registro_Unico puede venir como float/int, llenarlo con 0 si falta
+    if 'Flag_Registro_Unico' in rt_filt.columns:
+        rus_counts = rt_filt.groupby('VENDEDOR')['Flag_Registro_Unico'].sum().reset_index(name='RUS')
+        rus_counts['RUS'] = pd.to_numeric(rus_counts['RUS'], errors='coerce').fillna(0).astype(int)
+    else:
+        # Si no existe la columna, dejar RUS en 0
+        rus_counts = rt_filt.groupby('VENDEDOR').size().reset_index(name='RUS')
+        rus_counts['RUS'] = 0
+
     # Contar ALTAS totales por VENDEDOR
     altas_counts = altas_filt.groupby('VENDEDOR').size().reset_index(name='ALTAS')
 
@@ -92,9 +105,19 @@ def _construir_tabla_zonal2(df_rh, df_rt, df_altas, zonal2_vals):
     altas_regular = altas_filt[altas_filt['Scoring'] == 'REGULAR'].groupby('VENDEDOR').size().reset_index(name='ALTAS_REGULAR')
     altas_flex = altas_filt[altas_filt['Scoring'] == 'FLEX'].groupby('VENDEDOR').size().reset_index(name='ALTAS_FLEX')
 
+    # Contar ALTAS con RIESG >= 1 (riesgo Integratel) por VENDEDOR → columna AXB
+    if 'RIESG' in altas_filt.columns:
+        altas_riesg = pd.to_numeric(altas_filt['RIESG'], errors='coerce').fillna(0)
+        axb_counts = altas_filt[altas_riesg >= 1].groupby('VENDEDOR').size().reset_index(name='AXB')
+    else:
+        axb_counts = pd.DataFrame(columns=['VENDEDOR', 'AXB'])
+
     # Merge con tabla base (RRHH)
     tabla = tabla.merge(rt_counts, on='VENDEDOR', how='left')
     tabla['RT'] = tabla['RT'].fillna(0).astype(int)
+
+    tabla = tabla.merge(rus_counts, on='VENDEDOR', how='left')
+    tabla['RUS'] = tabla['RUS'].fillna(0).astype(int)
 
     tabla = tabla.merge(altas_counts, on='VENDEDOR', how='left')
     tabla['ALTAS'] = tabla['ALTAS'].fillna(0).astype(int)
@@ -105,14 +128,51 @@ def _construir_tabla_zonal2(df_rh, df_rt, df_altas, zonal2_vals):
     tabla = tabla.merge(altas_flex, on='VENDEDOR', how='left')
     tabla['ALTAS_FLEX'] = tabla['ALTAS_FLEX'].fillna(0).astype(int)
 
-    # RUS: por ahora siempre 0
-    tabla['RUS'] = 0
+    tabla = tabla.merge(axb_counts, on='VENDEDOR', how='left')
+    tabla['AXB'] = tabla['AXB'].fillna(0).astype(int)
 
     # Reordenar columnas
-    tabla = tabla[['SUPERVISOR', 'VENDEDOR', 'RT', 'RUS', 'ALTAS', 'ALTAS_REGULAR', 'ALTAS_FLEX']]
+    tabla = tabla[['SUPERVISOR', 'VENDEDOR', 'RT', 'RUS', 'ALTAS', 'ALTAS_REGULAR', 'ALTAS_FLEX', 'AXB']]
     tabla = tabla.sort_values(['SUPERVISOR', 'VENDEDOR']).reset_index(drop=True)
 
-    return tabla
+    # Agregar subtotales por supervisor y total general
+    tabla_con_subtotales = []
+    supervisores = tabla['SUPERVISOR'].unique()
+
+    for supervisor in supervisores:
+        datos_sup = tabla[tabla['SUPERVISOR'] == supervisor]
+        tabla_con_subtotales.append(datos_sup)
+
+        # Agregar fila de subtotal para este supervisor
+        subtotal_row = pd.DataFrame({
+            'SUPERVISOR': [f'SUB: {supervisor}'],
+            'VENDEDOR': [''],
+            'RT': [datos_sup['RT'].sum()],
+            'RUS': [datos_sup['RUS'].sum()],
+            'ALTAS': [datos_sup['ALTAS'].sum()],
+            'ALTAS_REGULAR': [datos_sup['ALTAS_REGULAR'].sum()],
+            'ALTAS_FLEX': [datos_sup['ALTAS_FLEX'].sum()],
+            'AXB': [datos_sup['AXB'].sum()]
+        })
+        tabla_con_subtotales.append(subtotal_row)
+
+    # Concatenar todas las filas
+    tabla_final = pd.concat(tabla_con_subtotales, ignore_index=True)
+
+    # Agregar total general al final
+    total_row = pd.DataFrame({
+        'SUPERVISOR': ['TOTAL GENERAL'],
+        'VENDEDOR': [''],
+        'RT': [tabla['RT'].sum()],
+        'RUS': [tabla['RUS'].sum()],
+        'ALTAS': [tabla['ALTAS'].sum()],
+        'ALTAS_REGULAR': [tabla['ALTAS_REGULAR'].sum()],
+        'ALTAS_FLEX': [tabla['ALTAS_FLEX'].sum()],
+        'AXB': [tabla['AXB'].sum()]
+    })
+    tabla_final = pd.concat([tabla_final, total_row], ignore_index=True)
+
+    return tabla_final
 
 def _crear_xlsx_tabla(tabla, titulo="Cuadro Resumen"):
     """
@@ -276,10 +336,12 @@ def _crear_xlsx_tabla(tabla, titulo="Cuadro Resumen"):
 
     return temp_file
 
-def _capturar_imagen_tabla_pil(tabla_df, titulo="Cuadro"):
+def _capturar_imagen_tabla_pil(tabla_df, titulo="Cuadro", subtitulo=None):
     """
-    Renderiza la tabla como imagen PNG usando PIL con ajuste automático de columnas.
-    Retorna la ruta del archivo PNG.
+    Renderiza tabla compacta con Aptos Narrow tamaño 13 y alta resolución.
+    Título: "[REGIÓN] - Avance al [FECHA]" en negrita.
+    Subtítulo opcional debajo del título: "Reporte de Ventas del [SUPERVISOR]".
+    Columnas: VENDEDOR, RT, RUS, ALT_REG, ALT_FLEX (sin SUPERVISOR, sin TOTAL GENERAL)
     """
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -293,161 +355,218 @@ def _capturar_imagen_tabla_pil(tabla_df, titulo="Cuadro"):
     )
 
     try:
-        # Fuente (intentar Aptos Narrow o fallback)
-        try:
-            font_normal = ImageFont.truetype("C:\\Windows\\Fonts\\aptos.ttf", 9)
-            font_bold = ImageFont.truetype("C:\\Windows\\Fonts\\aptos.ttf", 10)
-            font_title = ImageFont.truetype("C:\\Windows\\Fonts\\aptos.ttf", 12)
-        except:
+        # Fuentes Aptos Narrow tamaño 12 (más legible)
+        # Office instala Aptos en fuentes por-usuario, no en C:\Windows\Fonts
+        user_fonts_dir = os.path.join(
+            os.environ.get('LOCALAPPDATA', ''), 'Microsoft', 'Windows', 'Fonts'
+        )
+        aptos_narrow_candidates = [
+            os.path.join(user_fonts_dir, "Aptos-Narrow.ttf"),
+            "C:\\Windows\\Fonts\\aptos-narrow.ttf",
+            "C:\\Windows\\Fonts\\Aptos-Narrow.ttf",
+            "C:\\Windows\\Fonts\\AptosNarrow.ttf",
+            "C:\\Windows\\Fonts\\AptosNarrow-Regular.ttf",
+            "C:\\Windows\\Fonts\\aptos-narrow-regular.ttf",
+        ]
+        aptos_narrow_bold_candidates = [
+            os.path.join(user_fonts_dir, "Aptos-Narrow-Bold.ttf"),
+            "C:\\Windows\\Fonts\\aptos-narrow-bold.ttf",
+            "C:\\Windows\\Fonts\\Aptos-Narrow-Bold.ttf",
+            "C:\\Windows\\Fonts\\AptosNarrow-Bold.ttf",
+            "C:\\Windows\\Fonts\\aptos-narrowb.ttf",
+        ]
+
+        def _cargar_primera(candidatos, size):
+            for ruta in candidatos:
+                try:
+                    return ImageFont.truetype(ruta, size)
+                except:
+                    continue
+            return None
+
+        font_normal = _cargar_primera(aptos_narrow_candidates, 13)
+        font_header = _cargar_primera(aptos_narrow_bold_candidates, 13) or font_normal
+        font_title = _cargar_primera(aptos_narrow_bold_candidates, 16) or _cargar_primera(aptos_narrow_candidates, 16)
+        font_subtitulo = _cargar_primera(aptos_narrow_bold_candidates, 15) or font_header
+
+        if font_normal is None or font_header is None or font_title is None:
             try:
-                font_normal = ImageFont.truetype("C:\\Windows\\Fonts\\arial.ttf", 9)
-                font_bold = ImageFont.truetype("C:\\Windows\\Fonts\\arial.ttf", 10)
-                font_title = ImageFont.truetype("C:\\Windows\\Fonts\\arial.ttf", 12)
+                font_header = ImageFont.truetype("C:\\Windows\\Fonts\\arialbd.ttf", 13)
+                font_normal = ImageFont.truetype("C:\\Windows\\Fonts\\arial.ttf", 13)
+                font_title = ImageFont.truetype("C:\\Windows\\Fonts\\arialbd.ttf", 16)
+                font_subtitulo = ImageFont.truetype("C:\\Windows\\Fonts\\arialbd.ttf", 15)
             except:
-                font_normal = ImageFont.load_default()
-                font_bold = font_normal
-                font_title = font_normal
+                font_header = font_normal = font_title = font_subtitulo = ImageFont.load_default()
 
-        # Parámetros de diseño
-        margin = 15
-        padding_x = 8
-        padding_y = 6
-        cell_height = 24
-        header_height = 30
-        subheader_height = 18  # Altura para subheaders
-        title_height = 28
-        col_spacing = 2
+        # Parámetros de diseño tipo MODELO1 (compacto pero legible, sin truncar nombres)
+        margin = 10
+        padding_x = 4
+        cell_height = int(18 * 0.9 * 0.9 * 0.9)  # Reducido 10% + 10% + 10% adicional
+        header_height = int(20 * 0.9 * 0.9 * 0.9)  # Reducido 10% + 10% + 10% adicional
+        title_height = int(22 * 0.9 * 0.9 * 0.9) + 4  # Reducido 10%+10%+10%, +4 por tamaño de fuente 16
+        subtitulo_height = (int(18 * 0.9 * 0.9 * 0.9) + 4) if subtitulo else 0  # +4 por tamaño de fuente 15
+        col_spacing = 0
+        scale_factor = 2  # Escala 2x para mejor resolución
+        line_width = 1  # Grosor de líneas
 
-        # Definir anchos de columna con autoajuste
-        headers = ['SUPERVISOR', 'VENDEDOR', 'RT', 'RUS', 'ALTAS', 'ALTAS_REGULAR', 'ALTAS_FLEX']
+        # Calcular columna ALTAS = ALT_REG + ALT_FLEX por vendedor
+        tabla_df = tabla_df.copy()
+        tabla_df['ALTAS_TOTAL'] = (
+            pd.to_numeric(tabla_df['ALTAS_REGULAR'], errors='coerce').fillna(0) +
+            pd.to_numeric(tabla_df['ALTAS_FLEX'], errors='coerce').fillna(0)
+        ).astype(int)
 
-        # Calcular ancho necesario para cada columna
+        # Columnas con etiquetas (sin SUPERVISOR: ahora va como subtítulo)
+        headers = ['VENDEDOR', 'RT', 'RUS', 'ALTAS', 'REGULAR', 'FLEX', 'AXB']
+        # Mapeo de columnas internas del DataFrame
+        col_mapping = {
+            'VENDEDOR': 'VENDEDOR',
+            'RT': 'RT',
+            'RUS': 'RUS',
+            'ALTAS': 'ALTAS_TOTAL',
+            'REGULAR': 'ALTAS_REGULAR',
+            'FLEX': 'ALTAS_FLEX',
+            'AXB': 'AXB'
+        }
+
+        # Calcular ancho necesario para cada columna (SIN TRUNCAR nombres)
         col_widths = {}
         temp_img = Image.new('RGB', (1, 1))
         temp_draw = ImageDraw.Draw(temp_img)
 
-        for col_idx, header in enumerate(headers):
+        for display_header in headers:
             # Ancho del header
-            bbox = temp_draw.textbbox((0, 0), header, font=font_bold)
+            bbox = temp_draw.textbbox((0, 0), display_header, font=font_header)
             header_width = bbox[2] - bbox[0] + padding_x * 2
 
             # Ancho de los datos
-            if header in ['RT', 'RUS', 'ALTAS', 'ALTAS_REGULAR', 'ALTAS_FLEX']:
-                # Columnas numéricas: ancho fijo
+            if display_header in ['REGULAR', 'FLEX']:
+                # Columnas numéricas ALT_REG/ALT_FLEX: ancho fijo
                 data_width = 40
+            elif display_header in ['RT', 'RUS', 'ALTAS', 'AXB']:
+                # Columnas numéricas: estrechas pero proporcionadas
+                data_width = 24
             else:
-                # Columnas de texto: buscar el más largo
+                # Columnas de texto: ancho EXACTO del contenido más largo con límite máximo
                 max_width = header_width
-                for row_val in tabla_df[header]:
-                    val_str = str(row_val)[:40]  # Limitar a 40 caracteres
-                    bbox = temp_draw.textbbox((0, 0), val_str, font=font_normal)
-                    val_width = bbox[2] - bbox[0] + padding_x * 2
-                    max_width = max(max_width, val_width)
-                data_width = min(max_width, 250)  # Máximo 250px por columna
+                internal_col = col_mapping[display_header]
+                for row_val in tabla_df[internal_col]:
+                    val_str = str(row_val)  # SIN TRUNCAR
+                    if val_str.strip():  # Solo si no está vacío
+                        bbox = temp_draw.textbbox((0, 0), val_str, font=font_normal)
+                        val_width = bbox[2] - bbox[0] + padding_x * 2
+                        max_width = max(max_width, val_width)
+                # Límite máximo de 120 píxeles para columnas de texto
+                data_width = min(max_width, 120)
 
-            col_widths[header] = max(header_width, data_width)
+            if display_header in ['REGULAR', 'FLEX']:
+                # Ancho forzado: ignora el ancho del header aunque el texto se recorte
+                col_widths[display_header] = data_width
+            else:
+                col_widths[display_header] = max(header_width, data_width)
 
         # Calcular dimensiones de la imagen
         total_width = sum(col_widths.values()) + len(col_widths) * col_spacing + margin * 2
         num_rows = len(tabla_df)
-        # Una sola fila de headers con dos niveles (ALTAS se combina sobre REGULAR y FLEX)
-        img_height = title_height + header_height + (num_rows * cell_height) + margin * 2
+        img_height = title_height + subtitulo_height + header_height + (num_rows * cell_height) + margin * 2
 
-        # Crear imagen
-        img = Image.new('RGB', (total_width, img_height), color='white')
+        # Crear imagen escalada (2x para mejor resolución)
+        img_width_scaled = int(total_width * scale_factor)
+        img_height_scaled = int(img_height * scale_factor)
+        img = Image.new('RGB', (img_width_scaled, img_height_scaled), color='white')
         draw = ImageDraw.Draw(img)
 
-        # Dibujar título
-        draw.text((margin, margin), titulo, fill='black', font=font_title)
+        def scale(val):
+            return int(val * scale_factor)
 
-        # Dibujar headers
-        y = margin + title_height
-        x = margin
-        col_positions = {}
+        # Dibujar título en negrita
+        draw.text((scale(margin), scale(margin)), titulo, fill='black', font=font_title)
 
-        # Calcular ancho combinado para ALTAS (abarca solo ALTAS_REGULAR + ALTAS_FLEX)
-        altas_combined_width = col_widths['ALTAS_REGULAR'] + col_widths['ALTAS_FLEX'] + col_spacing
+        # Dibujar subtítulo (Reporte de [SUPERVISOR]) debajo del título, en azul y negrita
+        if subtitulo:
+            draw.text((scale(margin), scale(margin + title_height)), subtitulo, fill='#0000FF', font=font_subtitulo)
 
-        for col_idx, header in enumerate(headers):
-            col_width = col_widths[header]
-            col_positions[header] = (x, col_width)
+        # Dibujar encabezados (una sola fila)
+        y = scale(margin + title_height + subtitulo_height)
+        x = scale(margin)
 
-            if header == 'ALTAS':
-                # Dibujar ALTAS como encabezado principal combinado (gris oscuro)
-                # que abarca exactamente ALTAS_REGULAR + ALTAS_FLEX
-                draw.rectangle([x, y, x + altas_combined_width, y + header_height],
-                              fill='#D3D3D3', outline='black', width=1)
-                # Texto centrado
-                bbox = draw.textbbox((0, 0), 'ALTAS', font=font_bold)
-                text_width = bbox[2] - bbox[0]
-                text_height = bbox[3] - bbox[1]
-                text_x = x + (altas_combined_width - text_width) // 2
-                text_y = y + (header_height - text_height) // 2
-                draw.text((text_x, text_y), 'ALTAS', fill='black', font=font_bold)
+        for display_header in headers:
+            col_width = scale(col_widths[display_header])
 
-            elif header in ['ALTAS_REGULAR', 'ALTAS_FLEX']:
-                # Subheaders: REGULAR y FLEX bajo ALTAS (gris más claro)
-                display_name = 'REGULAR' if header == 'ALTAS_REGULAR' else 'FLEX'
-                draw.rectangle([x, y, x + col_width, y + header_height],
-                              fill='#E8E8E8', outline='black', width=1)
-                bbox = draw.textbbox((0, 0), display_name, font=font_normal)
-                text_width = bbox[2] - bbox[0]
-                text_height = bbox[3] - bbox[1]
-                text_x = x + (col_width - text_width) // 2
-                text_y = y + (header_height - text_height) // 2
-                draw.text((text_x, text_y), display_name, fill='black', font=font_normal)
+            # Fondo verde agua para encabezado con línea más gruesa
+            draw.rectangle([x, y, x + col_width, y + scale(header_height)],
+                          fill='#B2F7EF', outline='black', width=2)
 
-            else:
-                # Headers normales (SUPERVISOR, VENDEDOR, RT, RUS)
-                draw.rectangle([x, y, x + col_width, y + header_height],
-                              fill='#D3D3D3', outline='black', width=1)
-                # Texto centrado
-                bbox = draw.textbbox((0, 0), header, font=font_bold)
-                text_width = bbox[2] - bbox[0]
-                text_height = bbox[3] - bbox[1]
-                text_x = x + (col_width - text_width) // 2
-                text_y = y + (header_height - text_height) // 2
-                draw.text((text_x, text_y), header, fill='black', font=font_bold)
+            # Texto centrado en negrita
+            bbox = draw.textbbox((0, 0), display_header, font=font_header)
+            text_width = bbox[2] - bbox[0]
+            text_height = bbox[3] - bbox[1]
+            text_x = x + (col_width - text_width) // 2
+            text_y = y + (scale(header_height) - text_height) // 2
+            draw.text((text_x, text_y), display_header, fill='black', font=font_header)
 
-            x += col_width + col_spacing
+            x += col_width + scale(col_spacing)
 
-        # Dibujar filas de datos
-        y = margin + title_height + header_height
+        # Dibujar filas de datos (tabla_df viene filtrada por supervisor, con su fila SUB: al final)
+        y = scale(margin + title_height + subtitulo_height + header_height)
         for row_idx, row in tabla_df.iterrows():
-            x = margin
-            for col_idx, header in enumerate(headers):
-                col_width = col_widths[header]
+            supervisor_val = str(row.get('SUPERVISOR', ''))
+            is_subtotal = supervisor_val.startswith('SUB:')
 
-                # Fondo blanco para celda
-                draw.rectangle([x, y, x + col_width, y + cell_height],
-                              fill='white', outline='black', width=1)
+            if is_subtotal:
+                bg_color = '#E8E8E8'  # Gris claro para subtotal
+                cell_font = font_header
+            else:
+                bg_color = 'white'    # Blanco para vendedores
+                cell_font = font_normal
 
-                # Obtener valor
-                val = row.get(header, '')
-                val_str = str(val)[:40]  # Limitar a 40 caracteres
+            x = scale(margin)
+            for display_header in headers:
+                col_width = scale(col_widths[display_header])
+                internal_col = col_mapping[display_header]
 
-                # Alineación: derecha para números, izquierda para texto
-                if header in ['RT', 'RUS', 'ALTAS', 'ALTAS_REGULAR', 'ALTAS_FLEX']:
-                    # Alineación derecha para números
-                    bbox = draw.textbbox((0, 0), val_str, font=font_normal)
+                # Fondo de celda con gridlines definidas
+                draw.rectangle([x, y, x + col_width, y + scale(cell_height)],
+                              fill=bg_color, outline='#666666', width=1)
+
+                # Obtener valor (SIN TRUNCAR)
+                if is_subtotal and display_header == 'VENDEDOR':
+                    val_str = 'SUBTOTAL'
+                else:
+                    val = row.get(internal_col, '')
+                    val_str = str(val)
+
+                # Alineación: centrada para números, izquierda para texto
+                if display_header in ['RT', 'RUS', 'ALTAS', 'REGULAR', 'FLEX', 'AXB']:
+                    # Alineación centrada para números
+                    bbox = draw.textbbox((0, 0), val_str, font=cell_font)
                     text_width = bbox[2] - bbox[0]
-                    text_x = x + col_width - text_width - padding_x
+                    text_x = x + (col_width - text_width) // 2
                 else:
                     # Alineación izquierda para texto
-                    text_x = x + padding_x
+                    text_x = x + scale(padding_x)
 
                 # Centrar verticalmente
-                bbox = draw.textbbox((0, 0), val_str, font=font_normal)
+                bbox = draw.textbbox((0, 0), val_str, font=cell_font)
                 text_height = bbox[3] - bbox[1]
-                text_y = y + (cell_height - text_height) // 2
+                text_y = y + (scale(cell_height) - text_height) // 2
 
-                draw.text((text_x, text_y), val_str, fill='black', font=font_normal)
+                draw.text((text_x, text_y), val_str, fill='black', font=cell_font)
 
-                x += col_width + col_spacing
+                x += col_width + scale(col_spacing)
 
-            y += cell_height
+            y += scale(cell_height)
 
-        print(f"[DEBUG] Guardando imagen a: {temp_png} ({total_width}x{img_height})")
+        # Borde grueso perimetral alrededor de toda la tabla (encabezado + filas)
+        table_top = scale(margin + title_height + subtitulo_height)
+        table_left = scale(margin)
+        table_right = scale(margin) + sum(scale(w) for w in col_widths.values())
+        table_bottom = y
+        thick_border_width = scale(1)
+        draw.rectangle([table_left, table_top, table_right, table_bottom],
+                      outline='black', width=thick_border_width)
+
+        print(f"[DEBUG] Guardando imagen a: {temp_png} ({img_width_scaled}x{img_height_scaled})")
         img.save(temp_png, format='PNG')
         file_size = os.path.getsize(temp_png)
         print(f"[INFO] Imagen creada: {temp_png} ({file_size} bytes)")
@@ -459,12 +578,12 @@ def _capturar_imagen_tabla_pil(tabla_df, titulo="Cuadro"):
         traceback.print_exc()
         return None
 
-def _capturar_imagen_tabla(tabla_df, titulo="Cuadro"):
+def _capturar_imagen_tabla(tabla_df, titulo="Cuadro", subtitulo=None):
     """
     Captura la tabla como imagen PNG usando PIL.
     Retorna la ruta del archivo PNG.
     """
-    return _capturar_imagen_tabla_pil(tabla_df, titulo)
+    return _capturar_imagen_tabla_pil(tabla_df, titulo, subtitulo)
 
 def procesar_cuadro_resumen_sup(avance_path):
     """
@@ -497,10 +616,15 @@ def procesar_cuadro_resumen_sup(avance_path):
 
         # Definir grupos de zonales y sus destinos
         grupos = {
-            'FRANZ': {
-                'zonales': ['TACNA', 'ILO'],
+            'FRANZ_TACNA': {
+                'zonales': ['TACNA'],
                 'numero': '51933540190@c.us',
-                'titulo': 'TACNA - ILO'
+                'titulo': 'TACNA'
+            },
+            'FRANZ_ILO': {
+                'zonales': ['ILO'],
+                'numero': '51933540190@c.us',
+                'titulo': 'ILO'
             },
             'LETICIA_TRUJILLO': {
                 'zonales': ['TRUJILLO'],
@@ -547,44 +671,72 @@ def procesar_cuadro_resumen_sup(avance_path):
                     print(f"    → Sin datos para {titulo}")
                     continue
 
-                # Crear Excel (opcional, para backup)
-                xlsx_path = _crear_xlsx_tabla(tabla, titulo=f"Cuadro {titulo} - Avance al {fecha_str}")
+                # Quitar filas de subtotal (SUB:) y total general; agrupar por supervisor real
+                tabla_vendedores = tabla[
+                    ~tabla['SUPERVISOR'].str.startswith('SUB:') &
+                    (tabla['SUPERVISOR'] != 'TOTAL GENERAL')
+                ].copy()
 
-                # Capturar imagen directamente del DataFrame
-                png_path = _capturar_imagen_tabla(tabla, titulo=f"Cuadro {titulo} - Avance al {fecha_str}")
+                supervisores = tabla_vendedores['SUPERVISOR'].unique()
 
-                if png_path and os.path.exists(png_path):
-                    # Enviar por WhatsApp
-                    # Mensaje personalizado por jefe
-                    if jefe == 'FRANZ':
-                        mensaje = f"Hola Franz, te comparto el cuadro avance por supervisor/vendedor según el último avance"
-                    elif jefe.startswith('LETICIA'):
-                        mensaje = f"Hola Leticia, te comparto el cuadro avance {titulo} por supervisor/vendedor según el último avance"
+                # Una imagen por supervisor
+                for supervisor in supervisores:
+                    tabla_sup = tabla_vendedores[tabla_vendedores['SUPERVISOR'] == supervisor].copy()
+
+                    if len(tabla_sup) == 0:
+                        continue
+
+                    # Agregar fila de subtotal del supervisor al final de su propia tabla
+                    subtotal_row = pd.DataFrame({
+                        'SUPERVISOR': [f'SUB: {supervisor}'],
+                        'VENDEDOR': [''],
+                        'RT': [tabla_sup['RT'].sum()],
+                        'RUS': [tabla_sup['RUS'].sum()],
+                        'ALTAS': [tabla_sup['ALTAS'].sum()] if 'ALTAS' in tabla_sup.columns else [0],
+                        'ALTAS_REGULAR': [tabla_sup['ALTAS_REGULAR'].sum()],
+                        'ALTAS_FLEX': [tabla_sup['ALTAS_FLEX'].sum()],
+                        'AXB': [tabla_sup['AXB'].sum()] if 'AXB' in tabla_sup.columns else [0]
+                    })
+                    tabla_sup = pd.concat([tabla_sup, subtotal_row], ignore_index=True)
+
+                    subtitulo = f"Reporte de {supervisor}"
+
+                    # Crear Excel (opcional, para backup)
+                    xlsx_path = _crear_xlsx_tabla(tabla_sup, titulo=f"{titulo} - Avance al {fecha_str}")
+
+                    # Capturar imagen directamente del DataFrame con nuevo formato
+                    png_path = _capturar_imagen_tabla(
+                        tabla_sup,
+                        titulo=f"{titulo} - Avance al {fecha_str}",
+                        subtitulo=subtitulo
+                    )
+
+                    if png_path and os.path.exists(png_path):
+                        # Enviar por WhatsApp
+                        mensaje = f"Avance de {supervisor} al {fecha_str}"
+
+                        wa.send_image(destino, png_path, caption=mensaje)
+                        print(f"    [OK] Enviado a {jefe} ({supervisor})")
+                        envios_ok += 1
+
+                        # Limpiar
+                        try:
+                            os.remove(png_path)
+                        except:
+                            pass
                     else:
-                        mensaje = f"Cuadro resumen {titulo} - Avance al {fecha_str}"
+                        print(f"    [ERROR] Falló captura de imagen para {jefe} ({supervisor})")
 
-                    wa.send_image(destino, png_path, caption=mensaje)
-                    print(f"    [OK] Enviado a {jefe}")
-                    envios_ok += 1
-
-                    # Limpiar
+                    # Limpiar Excel temporal
                     try:
-                        os.remove(png_path)
+                        os.remove(xlsx_path)
                     except:
                         pass
-                else:
-                    print(f"    [ERROR] Falló captura de imagen para {jefe}")
 
-                # Limpiar Excel temporal
-                try:
-                    os.remove(xlsx_path)
-                except:
-                    pass
+                    time.sleep(2)  # Pequeña pausa entre envíos
 
             except Exception as e:
                 print(f"    [ERROR] Procesando {jefe}: {e}")
-
-            time.sleep(2)  # Pequeña pausa entre envíos
 
         print(f"[CUADRO RESUMEN SUP] Completado: {envios_ok}/{total_intentos} envíos exitosos")
         return envios_ok > 0

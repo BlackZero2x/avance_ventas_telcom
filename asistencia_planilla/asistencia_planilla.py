@@ -165,6 +165,33 @@ def _leer_hoja_api(service, sheet_id: str, nombre_hoja: str) -> pd.DataFrame:
 
 # ── Carga de datos ────────────────────────────────────────────────────────────
 
+def _cargar_dnis_operador_movistar():
+    """DNIs con OPERADOR=MOVISTAR desde la hoja RH del pipeline principal (AVANCE.py).
+
+    Esa hoja (SHEET_ID_RH/SHEET_ID_RH_GID) es distinta a la RRHH de este Sheet de
+    asistencia y sí trae la columna OPERADOR. Se lee como CSV público (sin OAuth).
+    Retorna None (no set vacío) si falla, para no filtrar de más por un error de red.
+    """
+    sheet_id = os.environ.get("SHEET_ID_RH")
+    gid = os.environ.get("SHEET_ID_RH_GID")
+    if not sheet_id or not gid:
+        logging.warning("Faltan SHEET_ID_RH / SHEET_ID_RH_GID en .env — se omite filtro OPERADOR.")
+        return None
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+    try:
+        df_rh = pd.read_csv(url)
+    except Exception as exc:
+        logging.warning(f"No se pudo leer hoja RH de OPERADOR ({exc}) — se omite filtro.")
+        return None
+    df_rh.columns = [c.strip().upper() for c in df_rh.columns]
+    if "DNI" not in df_rh.columns or "OPERADOR" not in df_rh.columns:
+        logging.warning("Hoja RH de OPERADOR sin columnas DNI/OPERADOR — se omite filtro.")
+        return None
+    df_rh["DNI"] = pd.to_numeric(df_rh["DNI"], errors="coerce")
+    mask = df_rh["OPERADOR"].astype(str).str.upper().str.strip() == "MOVISTAR"
+    return set(df_rh.loc[mask, "DNI"].dropna().astype(int))
+
+
 def cargar_rh(service) -> pd.DataFrame:
     logging.info(f"Cargando hoja {RRHH_HOJA} via API...")
     df = _leer_hoja_api(service, ASISTENCIA_SHEET_ID, RRHH_HOJA)
@@ -195,6 +222,17 @@ def cargar_rh(service) -> pd.DataFrame:
         logging.info(f"Filtro FEEDBACK_RH=EN CAMPO: {antes} -> {len(df)}")
     else:
         logging.warning("RH sin columna FEEDBACK_RH — no se aplica filtro de en campo.")
+
+    # Filtro 3: solo OPERADOR = MOVISTAR (columna no existe en esta hoja RRHH;
+    # se cruza por DNI con la hoja RH del pipeline principal de AVANCE.py)
+    dnis_movistar = _cargar_dnis_operador_movistar()
+    if dnis_movistar is not None:
+        antes = len(df)
+        dni_num = pd.to_numeric(df["DNI"], errors="coerce")
+        df = df[dni_num.isin(dnis_movistar)].copy()
+        logging.info(f"Filtro OPERADOR=MOVISTAR (cruce por DNI): {antes} -> {len(df)}")
+    else:
+        logging.warning("No se pudo cargar hoja RH de OPERADOR — no se aplica filtro.")
 
     # Normalizar columna de zona
     if "ZONA" in df.columns and "ZONAL" not in df.columns:

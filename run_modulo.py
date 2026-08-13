@@ -156,7 +156,14 @@ def _conectar_whatsapp():
 
 # ── AVANCE.py ─────────────────────────────────────────────────────────────────
 
-def _ejecutar_avance():
+def _ejecutar_avance(gmail_service=None):
+    if gmail_service is not None:
+        try:
+            from modules.shared.integratel_helper import descargar_adjunto_integratel
+            destino = os.path.join(os.path.dirname(os.path.abspath(__file__)), "integratel_riesgo.xlsx")
+            descargar_adjunto_integratel(gmail_service, destino)
+        except Exception as e:
+            logging.warning(f"[Integratel] No se pudo descargar el adjunto: {e}")
     logging.info("[0/6] Ejecutando AVANCE.py para generar archivos del dia...")
     import subprocess
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "AVANCE.py")
@@ -227,7 +234,7 @@ def _run(modulo, sheets_service, gmail_service, wa, forzar=False):
             logging.info("Saltando ejecucion de AVANCE.py (archivo ya generado)")
             registrar_avance_ok()
         else:
-            avance_ok = _ejecutar_avance()
+            avance_ok = _ejecutar_avance(gmail_service)
             if not avance_ok:
                 registrar_avance_fallo("AVANCE.py termino con error")
                 registrar_fin(False, "AVANCE.py termino con error")

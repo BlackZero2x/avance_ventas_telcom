@@ -15,7 +15,6 @@
   "wa_port": 8002,
 
   "backs_wa_group": "Nombre del grupo de backs en WhatsApp",
-  "backs_google_sheet_id": "ID_DE_TU_GOOGLE_SHEET",
   "backs_message": "Buen día equipo, el avance de ventas fue actualizado.",
   "backs_message_variants": [
     "Buen día equipo, el avance fue actualizado. Revisen el Drive.",
@@ -24,23 +23,23 @@
   ],
 
   "jefes_wa_group": "Nombre del grupo de jefes en WhatsApp",
-  "jefes_tds_rango1": "B4:V15",
-  "jefes_tds_rango2": "Y4:AT17",
+  "jefes_tds_rango1": "B4:AD15",
+  "jefes_tds_rango2": "AG4:BJ14",
   "jefes_mensaje_captura1_variants": [
-    "@NUMERO1 @NUMERO2 Buen día, remito avances actualizados.",
-    "@NUMERO1 @NUMERO2 Buenos días, adjunto el archivo actualizado."
+    "Buen día, remito avances actualizados.",
+    "Buenos días, adjunto el archivo actualizado."
   ],
   "jefes_mensaje_captura2_variants": [
-    "@NUMERO1 Detalle de avances por supervisor.",
-    "@NUMERO1 Aquí el detalle por supervisor."
+    "Detalle de avances por supervisor.",
+    "Aquí el detalle por supervisor."
   ],
   "jefes_mensaje_seguimiento_variants": [
-    "@NUMERO1 Adjunto el reporte de productividad actualizado.",
-    "@NUMERO1 Comparto el reporte actualizado."
+    "Adjunto el reporte de productividad actualizado.",
+    "Comparto el reporte actualizado."
   ],
-  "jefes_mensaje_captura1": "@NUMERO1 @NUMERO2 Buen día, remito avances actualizados.",
-  "jefes_mensaje_captura2": "@NUMERO1 Detalle de avances por supervisor.",
-  "jefes_mensaje_seguimiento": "@NUMERO1 Adjunto el reporte de productividad actualizado.",
+  "jefes_mensaje_captura1": "Buen día, remito avances actualizados.",
+  "jefes_mensaje_captura2": "Detalle de avances por supervisor.",
+  "jefes_mensaje_seguimiento": "Adjunto el reporte de productividad actualizado.",
   "jefes_menciones": ["NUMERO1@c.us", "NUMERO2@c.us"],
 
   "cristian_wa_contact": "Nombre Contacto 1",
@@ -61,9 +60,9 @@
 
   "carlos_email": "recipient@yourcompany.com",
   "guillermo_email": "recipient2@yourcompany.com",
+  "jesus_email": "recipient3@yourcompany.com",
 
   "italo_wa_contact": "Nombre Contacto 5",
-  "italo_google_sheet_id": "ID_DE_TU_GOOGLE_SHEET",
   "italo_message": "Hola, el reporte fue actualizado en Google Sheets.",
   "italo_message_variants": [
     "El reporte fue actualizado en Google Sheets. Ya puedes revisarlo.",

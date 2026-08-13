@@ -46,6 +46,10 @@ El script vive en `asistencia_planilla/asistencia_planilla.py` pero usa recursos
 1. `ESQUEMA == PLANILLA` (PART-TIME se mapea a PLANILLA)
 2. `ESTADO == ACTIVO`
 3. `FEEDBACK_RH == EN CAMPO`
+4. `OPERADOR == MOVISTAR` — la hoja RRHH de este Sheet **no tiene** columna OPERADOR;
+   se cruza por DNI contra la hoja RH del pipeline principal (`SHEET_ID_RH` /
+   `SHEET_ID_RH_GID` en `.env`, misma fuente que usa `AVANCE.py`), leída como CSV
+   público sin OAuth. Si esa hoja no carga, el filtro se omite (no bloquea el informe).
 
 ## Paleta de colores
 

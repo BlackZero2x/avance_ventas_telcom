@@ -155,12 +155,13 @@ AQP  = "'AREQUIPA'"
 TCN  = "'TACNA'"
 TRU  = "'TRUJILLO'"
 ILO  = "'ILO'"
-# CHB usa filtro mixto: IN para ciudades fijas + LIKE para todas las zonales LIMA*
-CHB_SQL = "(t.zonal IN ('CHIMBOTE','NORTE CHICO') OR t.zonal LIKE 'LIMA%')"
+LMA_SQL = "(t.zonal LIKE 'LIMA%')"
 
 HOJAS = [
-    ("RTCHB",       build_rt_query,    CHB_SQL, "'ALTA'"),
-    ("ALTASCHB",    build_altas_query, CHB_SQL, "'ALTA'"),
+    ("RTCHB",       build_rt_query,    CHB, "'ALTA'"),
+    ("ALTASCHB",    build_altas_query, CHB, "'ALTA'"),
+    ("RTLIMA",      build_rt_query,    LMA_SQL, "'ALTA'"),
+    ("ALTASLIMA",   build_altas_query, LMA_SQL, "'ALTA'"),
     ("ALTASAQP",    build_altas_query, AQP, "'ALTA'"),
     ("RTAQP",       build_rt_query,    AQP, "'ALTA'"),
     ("RTTCN",       build_rt_query,    TCN, "'ALTA'"),

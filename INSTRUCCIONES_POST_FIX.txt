@@ -1,0 +1,101 @@
+═══════════════════════════════════════════════════════════════════════════════
+INSTRUCCIONES POST-FIX: Puppeteer Crashes (2026-06-22)
+═══════════════════════════════════════════════════════════════════════════════
+
+RESUMEN DEL PROBLEMA:
+────────────────────
+- El 2026-06-22 el servidor WhatsApp (wa_server.js) colapsó
+- Duración: 09:43–15:34 (5 horas 51 minutos)
+- Causa: Puppeteer/Chromium en estado corrupto ("Promise was collected")
+- Síntoma: execution_log.json decía "todo OK" pero los mensajes nunca llegaron
+
+QUÉ SE ARREGLÓ:
+────────────────
+1. wa_client.py: Ahora detecta errores en respuestas HTTP 200
+2. wa_server.js: Watchdog mejorado detecta Puppeteer crashes y reinicia automáticamente
+3. Documentación: Análisis completo del incidente y recomendaciones
+
+VERIFICACIÓN INMEDIATA (AHORA):
+───────────────────────────────
+1. Confirmar que wa_server está corriendo:
+   python whatsapp_server\wa_client.py --health
+   → Debe mostrar: "Servidor WhatsApp: [OK] Listo"
+
+2. Revisar que wa_client.py está actualizado:
+   grep -n "Promise was collected" whatsapp_server\wa_client.py
+   → Debe mostrar una línea alrededor de línea 70
+
+3. Revisar que wa_server.js está actualizado:
+   grep -n "_isPuppeteerCrash" whatsapp_server\wa_server.js
+   → Debe mostrar múltiples líneas (watchdog + enqueue)
+
+PRÓXIMOS PASOS:
+───────────────
+
+A. INMINENTE (hoy):
+   ☐ Revisar que wa_server esté UP: tasklist | find "node.exe"
+   ☐ Si NO está UP, reiniciar: cd whatsapp_server && node wa_server.js
+   ☐ Hacer prueba manual: python whatsapp_server\wa_client.py --test
+
+B. MAÑANA (próxima ejecución AVANCE):
+   ☐ Ejecutar AVANCE.py normalmente
+   ☐ Monitorear logs en tiempo real:
+     tail -f logs\automation_*.log
+   ☐ Revisar execution_log.json después:
+     - Si ves "all_sent": true → todo bien
+     - Si ves "all_sent": false → revisar wa_server_YYYY-MM-DD.log
+
+C. ESTA SEMANA:
+   ☐ Verificar versión de whatsapp-web.js:
+     cd whatsapp_server && npm ls whatsapp-web.js
+   ☐ Si hay versión más nueva, actualizar:
+     npm update whatsapp-web.js
+   ☐ Implementar locker de mutex (ver ANALISIS_HORARIOS_WHATSAPP.md)
+
+MONITOREO DURANTE LA EJECUCIÓN:
+────────────────────────────────
+Si ves algo raro en wa_server logs:
+   - "Promise was collected" → wa_client reintentará automáticamente ✓
+   - "Protocol error" → watchdog reiniciará Chrome en <30s ✓
+   - Si sigue fallando después de reintentos → revisar logs detallados
+
+ARCHIVOS CLAVE:
+─────────────────
+Diagnóstico:      DIAGNOSTICO_PUPPETEER_CRASHES.md
+Resumen:          RESUMEN_FIX_PUPPETEER_2026-06-22.md
+Checklist:        CHECKLIST_PUPPETEER_FIX.md
+Código actualizado:
+  - whatsapp_server/wa_client.py (líneas 46–84)
+  - whatsapp_server/wa_server.js (líneas 150–228)
+
+PREGUNTAS FRECUENTES:
+──────────────────────
+
+P: ¿Qué pasa si el servidor vuelve a crashear?
+R: wa_client.py reintentará automáticamente 3 veces con espera creciente.
+   wa_server watchdog reiniciará el cliente en <30s.
+   Los mensajes eventualmente llegarán (después de reintentos).
+
+P: ¿Necesito hacer algo manual?
+R: No, está automatizado. Solo monitorear logs si ocurre otro crash.
+
+P: ¿El fix es permanente?
+R: Está mitigado. Recomendaciones futuras:
+   1. Actualizar whatsapp-web.js a versión más nueva
+   2. Agregar límite de memoria a Node.js
+   3. Implementar locker de mutex (ANALISIS_HORARIOS_WHATSAPP.md)
+
+P: ¿Afecta el fix a otros proyectos?
+R: No. Cambios solo en MOVISTAR. SSFF sigue con su propio wa_sender_antibang.py
+
+CONTACTO/ESCALACIÓN:
+─────────────────────
+Si vuelve a ocurrir un outage >1 hora:
+1. Revisar wa_server_YYYY-MM-DD.log
+2. Buscar "Promise was collected" o "Protocol error"
+3. Si aparecen múltiples (>5), probablemente sea memory leak
+4. Solución: taskkill /f /im node.exe && cd whatsapp_server && node wa_server.js
+
+═══════════════════════════════════════════════════════════════════════════════
+STATUS: ✅ LISTO PARA PRODUCCIÓN
+═══════════════════════════════════════════════════════════════════════════════

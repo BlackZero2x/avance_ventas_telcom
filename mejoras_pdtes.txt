@@ -1,0 +1,32 @@
+  Lo que más pesa hoy
+
+  1. xlwings abre Excel COM para los semáforos
+  Es el paso más lento después del SQL. xlwings lanza Excel, carga el archivo completo, pinta celda a celda, cierra. Eso son ~20-30s de overhead puro. Se puede eliminar completamente: los semáforos son solo colores condicionales
+  basados en valores numéricos — openpyxl puede calcular el valor directamente del DataFrame y aplicar el PatternFill sin abrir Excel. Eliminar xlwings ahorraría ~20-30s y eliminaría la dependencia de tener Excel instalado.
+
+  2. Las queries SQL se ejecutan secuencialmente
+  fija_registros_totales, fija_altas, y las demás se lanzan una tras otra. Si son independientes entre sí, podrían ejecutarse en paralelo con concurrent.futures.ThreadPoolExecutor. El ahorro depende del servidor, pero típicamente
+  30-50% del tiempo SQL.
+
+  3. Las fuentes Google Sheets también se leen secuencialmente
+  VENTORY, RH, LCF, MiFibra Sheet — cuatro requests HTTP uno tras otro. Con ThreadPoolExecutor correrían en paralelo. En red corporativa con proxy eso puede ser la diferencia entre 20s y 6s.
+
+  ---
+  Lo que mejoraría la robustez sin ser más rápido
+
+  4. _force_font_ws itera celda a celda sobre todo el worksheet
+  Esa función recorre cada celda de TDS para forzar "Aptos Narrow 11". Es O(n×m) sobre todas las celdas usadas. Una sola llamada ws.font = Font(...) sobre el rango completo es órdenes de magnitud más rápida.
+
+  5. El pipeline no tiene checkpoints
+  Si falla en la sección 7 de 9, empieza desde cero. Un checkpoint simple (guardar el DataFrame intermedio a parquet tras cada sección pesada) permitiría reanudar desde el punto de fallo sin re-ejecutar el SQL.
+
+  6. Las capturas de pantalla TDS dependen del timing de xlwings
+  Hay time.sleep() hardcodeados para esperar que Excel renderice. Eso es frágil — en máquinas lentas falla, en máquinas rápidas desperdicia tiempo. La alternativa es capturar desde openpyxl directamente a imagen (con matplotlib o
+  Pillow), sin depender de Excel abierto.
+
+  ---
+  Lo que cambiaría la arquitectura de fondo
+
+  7. El archivo Excel como output final es el cuello de botella de distribución
+  Cada día se genera, se envía por WA, se envía por correo, y los destinatarios lo abren en su máquina. Si en algún momento migras a Google Sheets como output (en lugar de Excel), el "envío" sería solo compartir el link — ya
+  actualizado — sin adjuntos. El script haría gspread.update() en lugar de openpyxl. Eso eliminaría también el paso de subir a Drive.

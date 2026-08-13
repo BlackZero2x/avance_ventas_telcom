@@ -2,9 +2,10 @@
 Proceso JEFES (Jefe de proyecto + Jefes de zona + Gerente comercial):
 Fuente: archivo AVANCE_{fecha}.xlsx generado por AVANCE.py
 
-1. Captura TDS!B4:AC15  → imagen → grupo JEFES + Jesús Ascencios por WhatsApp (8 últimos días)
-2. Captura TDS!AD4:BG14 → imagen → grupo JEFES + Jesús Ascencios por WhatsApp (8 últimos días)
-3. Enviar SEGUIMIENTO_VDD_FIJA_dd-mm-aaaa.xlsx como adjunto → grupo JEFES con mensaje + menciones
+1. Captura TDS!B4:AC15      → imagen → grupo JEFES + Jesús Ascencios por WhatsApp (8 últimos días)
+2. Captura TDS!AD4:BG14     → imagen → grupo JEFES + Jesús Ascencios por WhatsApp (8 últimos días)
+3. Captura MOVISTAR!T1:W10  → imagen sola, sin texto → grupo JEFES + Jesús Ascencios por WhatsApp
+4. Enviar SEGUIMIENTO_VDD_FIJA_dd-mm-aaaa.xlsx como adjunto → grupo JEFES con mensaje + menciones
 """
 import logging
 import os
@@ -56,6 +57,8 @@ class JefesProcess:
     def _capturar_rango(self, app, wb, sheet, rango, cap_path, excel_hwnd):
         """Exporta un rango de Excel como PNG. Intenta CopyPicture+clipboard primero;
         si falla (sesiones sin escritorio interactivo), usa el método Chart como fallback."""
+        sheet.activate()
+        time.sleep(0.5)
 
         # — Intento 1: CopyPicture → clipboard —
         for intento in range(3):
@@ -181,29 +184,33 @@ class JefesProcess:
 
             jesus_contact = self.config.get("jesus_wa_contact", None)
 
-            for rango, cap_path, msg, menc in [
-                (self.config["jefes_tds_rango1"], os.path.join(temp_dir, "captura_tds_1.png"), msg_captura1_con_menciones, menciones),
-                (self.config["jefes_tds_rango2"], os.path.join(temp_dir, "captura_tds_2.png"), msg_captura2, []),
+            for rango, cap_path, msg, menc, sheet_captura in [
+                (self.config["jefes_tds_rango1"], os.path.join(temp_dir, "captura_tds_1.png"), msg_captura1_con_menciones, menciones, sheet),
+                (self.config["jefes_tds_rango2"], os.path.join(temp_dir, "captura_tds_2.png"), msg_captura2, [], sheet),
+                (self.config["jefes_movistar_rango"], os.path.join(temp_dir, "captura_movistar_1.png"), None, [], wb.sheets["MOVISTAR"]),
             ]:
-                logging.info(f"  Capturando TDS!{rango}...")
-                if self._capturar_rango(app, wb, sheet, rango, cap_path, excel_hwnd):
+                nombre_hoja = sheet_captura.name
+                logging.info(f"  Capturando {nombre_hoja}!{rango}...")
+                if self._capturar_rango(app, wb, sheet_captura, rango, cap_path, excel_hwnd):
                     # Enviar imagen al grupo JEFES (sin caption para no mezclar texto con menciones)
                     self.wa.send_image(grupo, cap_path, caption="")
                     time.sleep(5)
                     # Enviar texto al grupo; el primer mensaje lleva menciones reales (@número en texto + array IDs)
-                    if menc:
-                        self.wa.send_mention(grupo, msg, menc)
-                    else:
-                        self.wa.send_text(grupo, msg)
-                    time.sleep(12)
+                    # msg=None → captura sin texto acompañante (ej. MOVISTAR!T1:W10)
+                    if msg is not None:
+                        if menc:
+                            self.wa.send_mention(grupo, msg, menc)
+                        else:
+                            self.wa.send_text(grupo, msg)
+                        time.sleep(12)
 
                     # Enviar imagen a Jesús Ascencios
                     if jesus_contact:
                         self.wa.send_image(jesus_contact, cap_path, caption="")
                         time.sleep(5)
-                        logging.info(f"  TDS enviada a {jesus_contact}")
+                        logging.info(f"  {nombre_hoja} enviada a {jesus_contact}")
                 else:
-                    logging.error(f"  No se pudo capturar TDS!{rango}")
+                    logging.error(f"  No se pudo capturar {nombre_hoja}!{rango}")
 
             return True
 

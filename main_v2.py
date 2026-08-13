@@ -416,6 +416,7 @@ class Orchestrator:
 
     def _ejecutar_avance(self):
         self._notificar_inicio_avance()
+        self._descargar_adjunto_integratel()
         logging.info("[0/6] Ejecutando AVANCE.py para generar archivos del dia...")
         import subprocess
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "AVANCE.py")
@@ -439,6 +440,19 @@ class Orchestrator:
             return False
         logging.info("[OK] AVANCE.py completado")
         return True
+
+    def _descargar_adjunto_integratel(self):
+        """Descarga el Excel de riesgo de Integratel antes de correr AVANCE.py.
+        Si falla o no hay correo nuevo, se mantiene el último archivo descargado
+        (el pipeline siempre debe tener un archivo de riesgo disponible)."""
+        try:
+            from shared.integratel_helper import descargar_adjunto_integratel
+            destino = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "integratel_riesgo.xlsx"
+            )
+            descargar_adjunto_integratel(self.gmail_service, destino)
+        except Exception as e:
+            logging.warning(f"[Integratel] No se pudo descargar el adjunto: {e}")
 
     def _enviar_diagnostico_error(self, stderr: str, stdout: str):
         """Envía correo de diagnóstico cuando AVANCE.py falla."""

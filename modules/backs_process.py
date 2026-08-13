@@ -10,6 +10,9 @@ import subprocess
 import sys
 from datetime import datetime
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import pandas as pd
 from msg_utils import pick_variant
 
@@ -50,14 +53,20 @@ class BacksProcess:
 
         logging.info("[3/3] Notificando grupo BACKS por WhatsApp...")
         mensaje = pick_variant(self.config.get("backs_message_variants"), self.config["backs_message"])
-        self.wa.send_text(self.config["backs_wa_group"], mensaje)
+        result = self.wa.send_text(self.config["backs_wa_group"], mensaje)
 
-        logging.info("PROCESO BACKS COMPLETADO")
-        return True
+        if result.get("success"):
+            logging.info("PROCESO BACKS COMPLETADO")
+            return True
+        else:
+            logging.error(f"Error notificando a BACKS: {result.get('error', 'unknown')}")
+            return False
 
     def _upload_to_sheets(self, excel_path):
         try:
-            sheet_id = self.config["backs_google_sheet_id"]
+            sheet_id = os.environ.get("BACKS_SHEET_ID") or self.config.get("backs_google_sheet_id")
+            if not sheet_id:
+                raise ValueError("BACKS_SHEET_ID no definido en .env")
             excel_file = pd.ExcelFile(excel_path)
             excel_sheet_names = excel_file.sheet_names
             logging.info(f"  {len(excel_sheet_names)} hojas encontradas en AVANCE_RESUMIDO")
@@ -84,38 +93,44 @@ class BacksProcess:
                     spreadsheetId=sheet_id, body={"requests": requests}
                 ).execute()
 
+            # Subir hojas secuencialmente — sheets_service no es thread-safe
+            xls = pd.ExcelFile(excel_path)
+            _hojas_fallidas = []
             for sheet_name in excel_sheet_names:
-                df = pd.read_excel(excel_path, sheet_name=sheet_name)
-                rows = []
-                for _, row in df.iterrows():
-                    row_values = []
-                    for v in row:
-                        if pd.isna(v):
-                            row_values.append("")
-                        elif isinstance(v, (pd.Timestamp, datetime)):
-                            row_values.append(v.strftime("%Y-%m-%d"))
-                        elif isinstance(v, (int, float)):
-                            row_values.append(v)
-                        else:
-                            row_values.append(str(v))
-                    rows.append(row_values)
+                try:
+                    df = xls.parse(sheet_name)
+                    rows = []
+                    for _, row in df.iterrows():
+                        row_values = []
+                        for v in row:
+                            if pd.isna(v):
+                                row_values.append("")
+                            elif isinstance(v, (pd.Timestamp, datetime)):
+                                row_values.append(v.strftime("%Y-%m-%d"))
+                            elif isinstance(v, (int, float)):
+                                row_values.append(v)
+                            else:
+                                row_values.append(str(v))
+                        rows.append(row_values)
+                    values = [df.columns.tolist()] + rows
+                    self.sheets_service.spreadsheets().values().clear(
+                        spreadsheetId=sheet_id,
+                        range=f"{sheet_name}!A1:ZZ100000"
+                    ).execute()
+                    self.sheets_service.spreadsheets().values().update(
+                        spreadsheetId=sheet_id,
+                        range=f"{sheet_name}!A1",
+                        valueInputOption="USER_ENTERED",
+                        body={"values": values}
+                    ).execute()
+                    logging.info(f"  Hoja '{sheet_name}' subida ({len(df)} filas)")
+                except Exception as _e_hoja:
+                    logging.error(f"  [ERROR] Hoja '{sheet_name}': {_e_hoja}")
+                    _hojas_fallidas.append(sheet_name)
 
-                values = [df.columns.tolist()] + rows
-
-                self.sheets_service.spreadsheets().values().clear(
-                    spreadsheetId=sheet_id,
-                    range=f"{sheet_name}!A1:ZZ100000"
-                ).execute()
-
-                self.sheets_service.spreadsheets().values().update(
-                    spreadsheetId=sheet_id,
-                    range=f"{sheet_name}!A1",
-                    valueInputOption="USER_ENTERED",
-                    body={"values": values}
-                ).execute()
-                logging.info(f"  Hoja '{sheet_name}' subida ({len(df)} filas)")
-
-            logging.info("  Todas las hojas subidas exitosamente")
+            if _hojas_fallidas:
+                logging.warning(f"  {len(_hojas_fallidas)} hojas fallaron: {_hojas_fallidas}")
+            logging.info("  Todas las hojas procesadas")
             return True
 
         except Exception as e:

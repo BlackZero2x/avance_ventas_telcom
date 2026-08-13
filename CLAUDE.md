@@ -2,6 +2,38 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Cambios en wa_server.js (18/07/2026 — estabilidad de la cola global)
+
+El servidor `whatsapp_server/wa_server.js` (puerto 8002) es **compartido por 5 proyectos**:
+AVANCE_MOVISTAR, SSFF (cortes + pedidos), Dash_consultas_pbi, VPN_MIFIBRA (captura de corte) y tablas Jesús.
+Tras las fallas del 15–17/07 (crash-loop de Chrome + "cola llena" por horas) se aplicó:
+
+- **Cola priorizada y drenable** (reemplaza la cadena de promesas anterior): array explícito con
+  prioridad. Campo opcional `priority` en el body de los endpoints de envío
+  (`"avance"` o número ≥10 = alta prioridad; default normal). AVANCE, al ser un evento
+  puntual por trigger de correo, debe enviar con `priority:"avance"` para pasar delante de
+  los cortes horarios de SSFF. **Al detectar contexto muerto (Promise collected / Protocol
+  error / detached Frame) la cola se DRENA de golpe** (rechaza todos los pendientes al
+  instante) en vez de esperar 5 s por cada uno — esto elimina la saturación de "cola llena".
+- **Chrome multiproceso**: se quitaron `--single-process` y `--no-zygote` de los args de
+  puppeteer (eran la causa raíz de "Promise was collected" bajo carga sostenida).
+- **Reinicio preventivo cada 6 h** (antes 1x nocturno), solo con cola vacía.
+- **Instancia única**: si el puerto 8002 ya está en uso, la nueva instancia aborta con
+  `EADDRINUSE` (evita dos clientes WA compitiendo por la misma sesión). El
+  `watchdog_wa_server.bat` mata node huérfano antes de relanzar.
+
+> Reiniciar `wa_server.js` como administrador para aplicar estos cambios (el proceso lo lanza
+> el Task Scheduler con privilegios elevados). Backup del original: `wa_server.js.bak_20260718`.
+
+### Integración VPN_MIFIBRA (captura de corte por WhatsApp)
+
+`C:\proyectos\VPN_MIFIBRA\enviar_captura_vpn.bat` genera el PNG del corte
+(`pivot_corte_dia.py --sin-descarga`) y lo envía con `enviar_captura_vpn.py` +
+`wa_client.py` al servidor 8002. Destino y textos en `VPN_MIFIBRA/config.json`
+(clave `captura_corte`). **Destino actual: número propio de prueba** (`51975155264@c.us`).
+Tareas programadas `VPN_Captura_*` (10:15, 12:40, 14:40, 16:40, 18:40, 20:40), 10 min
+después de cada sync VPN. Prioridad `normal` (no compite con el trigger de AVANCE).
+
   Antes de escribir o modificar cualquier código de este proyecto, aplica
   siempre estas reglas de confidencialidad:
 
@@ -49,10 +81,10 @@ python AVANCE.py
 
 **Requisitos previos:**
 - SQL Server `AUREN22\AUREN`, base de datos `eAuren`, ODBC Driver 17
-- Archivos Excel en el directorio de trabajo: `rh.xlsx`, `lcf.xlsx` (opcional: `cuotas.xlsx`, `cuotas_zonal_sup.xlsx`)
+- Archivos Excel en el directorio de trabajo: `rh.xlsx` (opcional: `cuotas.xlsx`, `cuotas_zonal_sup.xlsx`)
 - Entorno virtual compartido: `C:\proyectos\.venv\` (paquetes en `C:\proyectos\requirements.txt`)
 - Credenciales en `.env`: `SQL_SERVER`, `SQL_DATABASE`, `SQL_USER`, `SQL_PASSWORD`
-- CSV local MiFibra: ruta en `.env` como `MF_CSV_PATH`
+- Tabla SQL MiFibra: `[dbo].[mifibra_ventas_hora]` en la misma base `eAuren` (mismas credenciales SQL)
 - Google Sheet MiFibra privado: ID en `.env` como `MF_SHEET_ID`
 - Google credentials: `credentials.json` + `token.json` en la raíz del proyecto
 
@@ -100,7 +132,7 @@ El destinatario (`to`) puede ser un nombre de `config.json` o un ID directo de W
 ### Flujo de datos
 
 ```
-SQL Server (eAuren) + Excel (rh.xlsx, lcf.xlsx, cuotas.xlsx, cuotas_zonal_sup.xlsx)
+SQL Server (eAuren) + Excel (rh.xlsx, cuotas.xlsx, cuotas_zonal_sup.xlsx, integratel_riesgo.xlsx)
 + CSV local (BD_Ventas_AUREN.csv) + Google Sheet privado (MF_SHEET_ID)
         ↓
     AVANCE.py  (ETL: ~3.500 líneas, 9 secciones numeradas)
@@ -121,7 +153,7 @@ SQL Server (eAuren) + Excel (rh.xlsx, lcf.xlsx, cuotas.xlsx, cuotas_zonal_sup.xl
 | 4 | Enriquecimiento con RH (vendedor/supervisor/zona) |
 | 5 | Cálculo de antigüedad (`<15d`, `>15d`, `>30d`, `>60d`, `>90d`), semana, normalizaciones |
 | 6 | Renombrado de columnas a nombres estándar finales |
-| 7 | Join de score de riesgo LCF (`RIESG`) |
+| 7 | Join de riesgo Integratel por ORDER_KEY↔peticion (`RIESG`) |
 | 8 | Deduplicación y validación final |
 | 9 | Generación del libro Excel con múltiples hojas, tablas dinámicas y semáforo de colores |
 
@@ -185,17 +217,37 @@ Fuente global: Aptos Narrow 11.
 
 ### Fuente de datos MiFibra (ALTAS.MF en VDD1)
 
-Dos fuentes combinadas, deduplicadas por `(DNI, FECHA_INST)`:
-1. **CSV local** — `MF_CSV_PATH` en `.env`: `BD_Ventas_AUREN.csv`. Filtro: `ESTADO ORDEN SERVICIO 2 == "LIQUIDADA"`. DNI vendedor: columna `NUM DOC`.
-2. **Google Sheet privado** — `MF_SHEET_ID` en `.env`. Hoja `"MiFibra"`. Acceso autenticado con `token.json` (sin publicar). Groupby por `DNI vendedor`, `FECHA DE INSTALACION`, `mes_venta`. Filtrado por mes/año del período actual.
+Dos fuentes combinadas:
+1. **SQL Server** — tabla `[dbo].[mifibra_ventas_hora]` en `eAuren` (mismas credenciales que el pipeline principal). Histórico versionado por contrato (`es_actual=1` = versión vigente de cada `numcontrato`). VENTAS: filtro por `fechainscripcionficha` (renombrado `FECHA DE VENTA`) = mes actual. INSTALADAS: filas con `fechainstinternet` (renombrado `FECHA DE INSTALACION`) no nula. `PLAN FINAL` se mapea desde `paqueteinicialinternet`. Normalización FILIAL: ANCASH→CHIMBOTE, LA LIBERTAD→TRUJILLO.
+2. **Google Sheet privado** — `MF_SHEET_ID` en `.env`. Hoja `"MiFibra"`. Actúa como lookup `NUMERO CONTRATO → DNI_vendedor`. Acceso autenticado con `token.json`.
 
-Si el Sheet no está disponible (sin red, token vencido), el proceso continúa solo con el CSV.
+Si SQL falla, `_mf_raw` queda vacío y el pipeline continúa sin datos MiFibra (no aborta).
+
+### Fuente de datos Integratel (RIESG en RT/ALTAS)
+
+Excel enviado por correo desde `eduardo.pinco@integratel.com.pe`, asunto fijo
+`"Reporte de casos observados sujetos a PRE-PENALIDAD - Socio AUREN (MASIVO)"`.
+`main_v2.py` / `run_modulo.py` descargan el adjunto más reciente (vía
+`modules/shared/integratel_helper.py`) **antes** de invocar `AVANCE.py`, y lo
+**acumulan** sobre `integratel_riesgo.xlsx` (cada adjunto trae solo casos
+recientes, no el histórico completo). Se deduplica por `ORDER_KEY`, ganando la
+fila del adjunto nuevo si el mismo `ORDER_KEY` ya estaba acumulado. Así el
+archivo sigue sirviendo entre meses — el filtro real por período lo aplica
+`AVANCE.py` al comparar contra `peticion` del mes actual, así que las filas
+viejas no afectan el resultado. Si no llega correo nuevo, el archivo
+acumulado existente se conserva sin cambios.
+
+`AVANCE.py` lee la primera hoja del Excel y usa el campo `ORDER_KEY`: si el
+`peticion` de un registro de RT o ALTAS aparece en `ORDER_KEY`, `RIESG = 1`;
+si no, `RIESG = 0`. Reemplaza por completo al antiguo join con LCF
+(`URL_LCF`, obsoleto). Si `integratel_riesgo.xlsx` no existe, `RIESG` queda
+en 0 para todos y se imprime un aviso.
 
 ### TDS — Tablas y captura de pantalla
 
 - **Tabla 1** (cols B–V): métricas por ZONAL. HC (col O/P) usa `SUMIF(Y:Y, B{r}, AM:AM)` — criterio exacto igual al nombre de la zonal en tabla 2.
 - **Tabla 2** (cols Y–AT): métricas por SUPERVISOR. Datos leídos dinámicamente de `cuotas_zonal_sup.xlsx` hoja `SUPERVISOR`. Bordes: fila penúltima sin borde inferior, última fila (totales) con borde inferior.
-- **Captura enviada a jefes**: `jefes_tds_rango1 = "B4:V15"` y `jefes_tds_rango2 = "Y4:AT17"` (configurables en `config.json`).
+- **Captura enviada a jefes**: `jefes_tds_rango1 = "B4:AD15"` y `jefes_tds_rango2 = "AG4:BJ14"` (configurables en `config.json`).
 
 ### Componentes de WhatsApp
 
@@ -262,12 +314,14 @@ El orquestador `main_v2.py` se dispara vía Programador de Tareas de Windows (lu
 | `SQL_SERVER` | Servidor SQL (`AUREN22\AUREN`) |
 | `SQL_DATABASE` | Base de datos (`eAuren`) |
 | `SQL_USER` / `SQL_PASSWORD` | Credenciales SQL |
-| `MF_CSV_PATH` | Ruta al CSV local `BD_Ventas_AUREN.csv` |
+| ~~`MF_CSV_PATH`~~ | Obsoleto — reemplazado por `[dbo].[mifibra_ventas_hora]` en SQL |
 | `MF_SHEET_ID` | ID del Google Sheet privado de MiFibra |
-| `URL_VENTORY` / `URL_RH` / `URL_LCF` | URLs CSV públicas de Google Sheets |
+| `URL_VENTORY` | URL CSV pública de Google Sheets (VENTORY) |
+| ~~`URL_LCF`~~ | Obsoleto — RIESG ahora viene de `integratel_riesgo.xlsx` (ORDER_KEY↔peticion) |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` | Proxy corporativo |
 | `AVANCE_DIR` | Ruta raíz del proyecto |
 | `CHECK_INTERVAL_MINUTES` | Intervalo de polling del orquestador (default 10) |
+| `OWNER_WA_ID` | Número WA del responsable técnico (`51XXXXXXXXX@c.us`). Recibe alertas internas y el send-test periódico cada 3 horas. |
 
 ## Glosario de términos del dominio
 
@@ -280,7 +334,7 @@ El orquestador `main_v2.py` se dispara vía Programador de Tareas de Windows (lu
 | VDD2 | Seguimiento diario (reemplaza la antigua hoja de pivot diario) |
 | zonal2 | Campo normalizado: "LIMA" para cualquier sub-zonal LIMA; igual a `zonal` para el resto |
 | RH | Recursos Humanos (mapeo vendedor/supervisor/zona) |
-| LCF | Datos de riesgo crediticio (campo `RIESG`) |
+| RIESG | Score de riesgo (1/0), calculado por cruce ORDER_KEY↔peticion con el Excel de Integratel |
 | AVANCE | Porcentaje de cumplimiento vs cuota |
 | eAuren | Nombre de la base de datos en SQL Server |
 | FE | Código interno del vendedor usado para los joins |

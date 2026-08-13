@@ -61,3 +61,15 @@ cortes_ventas/temp/
 # OS
 .DS_Store
 Thumbs.db
+
+# Backups y datos sensibles sueltos
+config_original.json
+checkpoints/
+*.zip
+avancev2_log.txt
+log_ejecucion_manual_avance.txt
+log_claude_edits.txt
+handoff.md
+Captura_blindaje.PNG
+tabla_zonales.PNG
+desktop.ini

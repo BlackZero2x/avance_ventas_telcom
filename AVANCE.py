@@ -3635,6 +3635,8 @@ with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
 
     _fmt_sheet(writer.sheets["RT"],    _rt_out,    "Tbl_RT",    "TableStyleLight8",  is_altas=False)
     _fmt_sheet(writer.sheets["ALTAS"], _altas_out, "Tbl_ALTAS", "TableStyleLight11", is_altas=True)
+    # Exportar RH completa (sin filtro OPERADOR porque la columna no existe en la fuente)
+    # La fuente Google Sheets de RH no tiene columna OPERADOR, así que no se puede filtrar aquí.
     rh.to_excel(writer, sheet_name="RH", index=False)
     ventory.to_excel(writer, sheet_name="VENTORY", index=False)
 
