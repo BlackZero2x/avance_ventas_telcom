@@ -59,8 +59,22 @@ function resolveRecipient(nameOrId) {
 // ============================================================
 let waClient = null;
 let isReady = false;
+let _readySince = null;        // timestamp del último evento "ready" (ventana de gracia post-reinicio)
 let _lastUploadError = null;   // timestamp del último "upload failed" para el health check
 let _lastNotificacion = null;  // timestamp del último correo de alerta (throttle 30 min)
+
+// Ventana de gracia tras un reinicio: el evento "ready" de whatsapp-web.js se
+// dispara antes de que el store interno de WhatsApp Web termine de sincronizar
+// del todo. Si hay envíos en cola justo en ese momento (ej. cortes horarios de
+// SSFF acumulados durante el reinicio), sendMessage() no lanza excepción pero
+// devuelve `undefined` — eso se contaba como "fallo de protocolo" y disparaba
+// OTRO reinicio, entrando en loop (204 reinicios el 14/08/2026 en un solo día).
+// _enGraciaPostReinicio() se usa para no drenar la cola de inmediato y para no
+// sumar al contador de fallos consecutivos mientras dura la ventana.
+const _GRACIA_POST_REINICIO_MS = 12000;
+function _enGraciaPostReinicio() {
+  return _readySince !== null && (Date.now() - _readySince) < _GRACIA_POST_REINICIO_MS;
+}
 
 // Envía una alerta por correo al administrador cuando la sesión WA falla.
 // Tiene throttle: solo envía un correo cada 30 minutos aunque el error persista.
@@ -176,6 +190,7 @@ function startWhatsApp() {
 
   waClient.on("ready", () => {
     isReady = true;
+    _readySince = Date.now();
     log("INFO", "Cliente WhatsApp listo");
   });
 
@@ -354,6 +369,17 @@ function enqueue(fn, priority = PRIORITY_NORMAL) {
 async function _procesarCola() {
   if (_draining) return;           // ya hay un envío en curso
   if (_queue.length === 0) return;
+
+  // Ventana de gracia post-reinicio: no drenar la cola hasta que el store de
+  // WhatsApp Web probablemente terminó de sincronizar (ver _enGraciaPostReinicio).
+  // Reintenta más tarde en vez de disparar sendMessage() contra una sesión
+  // que aún no está lista de verdad.
+  if (_enGraciaPostReinicio()) {
+    const _restante = _GRACIA_POST_REINICIO_MS - (Date.now() - _readySince);
+    setTimeout(() => _procesarCola(), Math.max(_restante, 500));
+    return;
+  }
+
   _draining = true;
 
   const item = _queue.shift();
@@ -445,6 +471,13 @@ function _registrarResultadoEnvio(kind, result, ctx) {
     if (_sendTestFails > 0) log("INFO", "Envio recuperado tras fallos previos de protocolo");
     _sendTestFails = 0;
     log("INFO", kind, ctx);
+    return;
+  }
+  if (_enGraciaPostReinicio()) {
+    // Dentro de la ventana de gracia post-reinicio: el store de WhatsApp Web
+    // probablemente aún no sincronizó del todo. No cuenta como fallo de
+    // protocolo — evita el loop de reinicios en cascada (ver _GRACIA_POST_REINICIO_MS).
+    log("WARN", `${kind}: sendMessage devolvio resultado sin id (dentro de ventana de gracia post-reinicio, no cuenta como fallo)`, ctx);
     return;
   }
   _sendTestFails++;
@@ -713,6 +746,11 @@ async function _runSendTest() {
   try {
     const result = await waClient.sendMessage(chatId, "✔️ [auto-test] servidor WA operativo");
     if (!result || !result.id) {
+      if (_enGraciaPostReinicio()) {
+        // Ver _GRACIA_POST_REINICIO_MS: no cuenta como fallo de protocolo.
+        log("WARN", "Send-test: sendMessage devolvio undefined (dentro de ventana de gracia post-reinicio, no cuenta como fallo)", { chatId });
+        return;
+      }
       _sendTestFails++;
       log("WARN", `Send-test: sendMessage devolvio undefined (fallo #${_sendTestFails})`, { chatId });
       if (_sendTestFails >= 2) {
