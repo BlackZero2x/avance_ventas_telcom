@@ -96,6 +96,7 @@ from jefes_email_process import JefesEmailProcess
 from italo_process import ItaloProcess
 from supervisor_alert_process import SupervisorAlertProcess
 from cuadro_resumen_sup_process import procesar_cuadro_resumen_sup
+from cuadro_resumen_sup_diario_process import procesar_cuadro_resumen_sup_diario
 from shared.execution_log import (
     registrar_trigger, registrar_avance_ok, registrar_avance_fallo,
     registrar_modulo, registrar_fin,
@@ -607,6 +608,7 @@ class Orchestrator:
             ("italo",            lambda: ItaloProcess(self.config, self.sheets_service, self.wa).execute()),
             ("supervisor_alert", lambda: SupervisorAlertProcess(self.config, self.wa).execute()),
             ("cuadro_resumen_sup", lambda: procesar_cuadro_resumen_sup(self._obtener_ultimo_avance())),
+            ("cuadro_resumen_sup_diario", lambda: procesar_cuadro_resumen_sup_diario(self._obtener_ultimo_avance())),
         ]
 
         results = {}
