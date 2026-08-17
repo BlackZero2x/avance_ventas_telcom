@@ -216,11 +216,44 @@ function startWhatsApp() {
 
 let _reconectando = false;
 
+// Circuit breaker: si hay demasiados reinicios en poco tiempo, el propio
+// auto-reinicio deja de ser la solución y pasa a ser parte del problema
+// (ver incidente 15/08/2026: 217 reinicios en una tarde, cada 20-40s, sin
+// estabilizarse nunca — compatible con una sesión de WhatsApp Web degradada
+// del lado de Meta, no con algo que un reinicio de Chrome pueda arreglar).
+// Si se detectan más de _BREAKER_MAX_REINICIOS dentro de _BREAKER_VENTANA_MS,
+// se deja de reintentar automáticamente y se escala una alerta inmediata
+// (sin el throttle de 30 min) para que se revise la sesión manualmente. (17/08/2026)
+const _BREAKER_MAX_REINICIOS = 6;
+const _BREAKER_VENTANA_MS = 10 * 60 * 1000; // 10 minutos
+let _reinicios = []; // timestamps de reinicios recientes
+let _breakerAbierto = false;
+
 async function _reiniciarCliente() {
+  if (_breakerAbierto) {
+    log("WARN", "Circuit breaker abierto — reinicio automatico suspendido, se requiere revision manual");
+    return;
+  }
   if (_reconectando) {
     log("INFO", "Reconexion ya en curso, ignorando duplicado");
     return;
   }
+
+  const ahora = Date.now();
+  _reinicios = _reinicios.filter((t) => ahora - t < _BREAKER_VENTANA_MS);
+  _reinicios.push(ahora);
+  if (_reinicios.length > _BREAKER_MAX_REINICIOS) {
+    _breakerAbierto = true;
+    isReady = false;
+    log("ERROR", `Circuit breaker activado: ${_reinicios.length} reinicios en los ultimos ${_BREAKER_VENTANA_MS / 60000} min — se detiene el auto-reinicio`);
+    _lastNotificacion = null; // fuerza que la siguiente alerta ignore el throttle de 30 min
+    _notificarError(
+      "Circuit breaker WA activado",
+      `Se detectaron ${_reinicios.length} reinicios en ${_BREAKER_VENTANA_MS / 60000} minutos. El servidor dejo de reintentar automaticamente para no agravar el problema. Revisar manualmente la sesion de WhatsApp Web (Dispositivos vinculados) y reiniciar el proceso wa_server.js cuando este resuelto.`
+    );
+    return;
+  }
+
   _reconectando = true;
   isReady = false;
   log("INFO", "Destruyendo cliente anterior...");
@@ -497,6 +530,12 @@ function _registrarResultadoEnvio(kind, result, ctx) {
 // Guard reutilizable: rechaza si el servidor no está listo o la cola está llena.
 function _guardReady(res) {
   if (!isReady) {
+    // Antes esto era un agujero negro: un envío real rechazado aquí (servidor
+    // en medio de un reinicio o loop de degradación) no dejaba ningún rastro
+    // en el log, indistinguible de que nadie hubiese intentado enviar nada
+    // (ver incidente 15/08/2026, 217 reinicios en la tarde sin evidencia de
+    // cuántos envíos reales se perdieron). (17/08/2026)
+    log("WARN", "Envio rechazado: WhatsApp no esta listo (503)");
     res.status(503).json({ error: "WhatsApp no esta listo" });
     return false;
   }
@@ -512,6 +551,9 @@ function _guardReady(res) {
 // Además de isReady, verifica que el frame de Chrome siga respondiendo.
 // Si hubo un "upload failed" reciente (último minuto), reporta degraded y fuerza reconexión.
 app.get("/health", async (req, res) => {
+  if (_breakerAbierto) {
+    return res.json({ status: "circuit_breaker_abierto", reinicios_recientes: _reinicios.length, timestamp: new Date().toISOString() });
+  }
   if (!isReady) {
     return res.json({ status: "not_ready", timestamp: new Date().toISOString() });
   }

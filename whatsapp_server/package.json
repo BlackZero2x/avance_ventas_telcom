@@ -15,6 +15,6 @@
     "dotenv": "^17.4.2",
     "express": "^4.22.1",
     "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "github:pedroslopez/whatsapp-web.js"
+    "whatsapp-web.js": "github:pedroslopez/whatsapp-web.js#92f443fb6b4fb3ee52c6576bc640b4a2e17379ae"
   }
 }
