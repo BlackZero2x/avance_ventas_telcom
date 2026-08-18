@@ -101,6 +101,7 @@ from shared.execution_log import (
     registrar_trigger, registrar_avance_ok, registrar_avance_fallo,
     registrar_modulo, registrar_fin,
 )
+from shared.screenshot_safe import ScreenshotManager
 
 # ── Verificación de datos SQL actualizados ─────────────────────────────────────
 
@@ -392,18 +393,30 @@ class Orchestrator:
         time.sleep(15)
 
         # Matar cualquier instancia de Excel que siga abierta tras el aviso.
-        try:
-            import subprocess as _sp
-            result = _sp.run(
-                ["taskkill", "/F", "/IM", "excel.exe"],
-                capture_output=True, text=True,
-            )
-            if "excel.exe" in result.stdout.lower():
-                logging.info("  Excel cerrado forzosamente antes de ejecutar AVANCE.py")
-            else:
-                logging.info("  Sin instancias de Excel activas al iniciar.")
-        except Exception as _e:
-            logging.warning(f"  No se pudo cerrar Excel: {_e}")
+        # IMPORTANTE: se adquiere el lock global EXCEL_COM antes del taskkill,
+        # porque un taskkill /IM excel.exe mata TODAS las instancias del sistema,
+        # incluida la de otro proyecto (p.ej. SSFF) que en ese momento tenga Excel
+        # abierto legítimamente bajo el mismo lock. Sin esta serialización, el
+        # taskkill puede noquear la instancia COM de otro proceso a mitad de una
+        # captura (visto en incidente SSFF_Corte_10AM del 18/08/2026).
+        lock_taskkill = ScreenshotManager("MOVISTAR_TASKKILL_PRE_AVANCE")
+        if not lock_taskkill.adquirir_lock(timeout=120):
+            logging.warning("  No se pudo adquirir lock EXCEL_COM para el taskkill — se omite el cierre forzado.")
+        else:
+            try:
+                import subprocess as _sp
+                result = _sp.run(
+                    ["taskkill", "/F", "/IM", "excel.exe"],
+                    capture_output=True, text=True,
+                )
+                if "excel.exe" in result.stdout.lower():
+                    logging.info("  Excel cerrado forzosamente antes de ejecutar AVANCE.py")
+                else:
+                    logging.info("  Sin instancias de Excel activas al iniciar.")
+            except Exception as _e:
+                logging.warning(f"  No se pudo cerrar Excel: {_e}")
+            finally:
+                lock_taskkill.liberar_lock()
 
     # Destinatarios del correo de diagnóstico cuando AVANCE.py falla.
     # Leer desde variable de entorno (lista separada por comas) o usar lista fija.
