@@ -64,6 +64,12 @@ def _construir_tabla_diaria_zonal2(df_rt, df_altas, zonal2_vals):
 
     altas_por_dia = altas_filt.groupby('DIA').size().rename('ALTAS')
 
+    if 'RIESG' in altas_filt.columns:
+        altas_riesg = pd.to_numeric(altas_filt['RIESG'], errors='coerce').fillna(0)
+        axb_por_dia = altas_filt[altas_riesg >= 1].groupby('DIA').size().rename('AXB')
+    else:
+        axb_por_dia = pd.Series(dtype=int, name='AXB')
+
     if 'Scoring' in altas_filt.columns:
         regular_por_dia = altas_filt[altas_filt['Scoring'] == 'REGULAR'].groupby('DIA').size().rename('REGULAR')
         flex_por_dia = altas_filt[altas_filt['Scoring'] == 'FLEX'].groupby('DIA').size().rename('FLEX')
@@ -77,10 +83,11 @@ def _construir_tabla_diaria_zonal2(df_rt, df_altas, zonal2_vals):
     tabla = tabla.merge(rt_por_dia, on='DIA', how='left')
     tabla = tabla.merge(rus_por_dia, on='DIA', how='left')
     tabla = tabla.merge(altas_por_dia, on='DIA', how='left')
+    tabla = tabla.merge(axb_por_dia, on='DIA', how='left')
     tabla = tabla.merge(regular_por_dia, on='DIA', how='left')
     tabla = tabla.merge(flex_por_dia, on='DIA', how='left')
 
-    for col in ['RT', 'RUS', 'ALTAS', 'REGULAR', 'FLEX']:
+    for col in ['RT', 'RUS', 'ALTAS', 'AXB', 'REGULAR', 'FLEX']:
         tabla[col] = tabla[col].fillna(0).astype(int)
 
     tabla = tabla.sort_values('DIA').reset_index(drop=True)
@@ -92,11 +99,12 @@ def _construir_tabla_diaria_zonal2(df_rt, df_altas, zonal2_vals):
         'RT': [tabla['RT'].sum()],
         'RUS': [tabla['RUS'].sum()],
         'ALTAS': [tabla['ALTAS'].sum()],
+        'AXB': [tabla['AXB'].sum()],
         'REGULAR': [tabla['REGULAR'].sum()],
         'FLEX': [tabla['FLEX'].sum()],
     })
     tabla_final = pd.concat(
-        [tabla[['DIA', 'DIA_LABEL', 'RT', 'RUS', 'ALTAS', 'REGULAR', 'FLEX']], total_row],
+        [tabla[['DIA', 'DIA_LABEL', 'RT', 'RUS', 'ALTAS', 'AXB', 'REGULAR', 'FLEX']], total_row],
         ignore_index=True
     )
 
@@ -172,8 +180,8 @@ def _capturar_imagen_tabla_diaria(tabla_df, titulo="Cuadro", subtitulo=None):
         gap_entre_tablas = 14  # separación vertical entre la tabla diaria y la de REGULAR/FLEX
         subtitulo2_height = int(18 * 0.9 * 0.9 * 0.9) + 4
 
-        headers = ['DÍA', 'RT', 'RUS', 'ALTAS']
-        col_mapping = {'DÍA': 'DIA_LABEL', 'RT': 'RT', 'RUS': 'RUS', 'ALTAS': 'ALTAS'}
+        headers = ['DÍA', 'RT', 'RUS', 'ALTAS', 'AXB']
+        col_mapping = {'DÍA': 'DIA_LABEL', 'RT': 'RT', 'RUS': 'RUS', 'ALTAS': 'ALTAS', 'AXB': 'AXB'}
 
         # Tabla 2: resumen ALTAS por tipo (REGULAR / FLEX) — solo fila de totales
         total_regular = int(tabla_df.loc[tabla_df['DIA_LABEL'] == 'TOTAL', 'REGULAR'].iloc[0]) \
@@ -191,7 +199,7 @@ def _capturar_imagen_tabla_diaria(tabla_df, titulo="Cuadro", subtitulo=None):
             bbox = temp_draw.textbbox((0, 0), display_header, font=font_header)
             header_width = bbox[2] - bbox[0] + padding_x * 2
 
-            if display_header in ['RT', 'RUS', 'ALTAS']:
+            if display_header in ['RT', 'RUS', 'ALTAS', 'AXB']:
                 # Ancho forzado (20% más angosto que el original de 40px): ignora el header aunque se recorte
                 col_widths[display_header] = 32
                 continue
